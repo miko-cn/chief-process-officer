@@ -20,6 +20,7 @@
 
 **环境备注（未来会话必读）**：
 - git push/fetch 前若遇 `Permission denied (publickey)`：重试一次；若持续失败，重建主连接：`ssh -N -f git@github.com`（可循环重试直到成功），成功后 git 操作走复用通道
+- **本机 git push 若报 msys 崩溃（`couldn't create signal pipe, Win32 error 5`，栈帧在 PortableGit 的 ssh.exe/sh.exe + msys-2.0.dll）**：这是 DSH 沙箱限制命名管道导致 PortableGit 的 msys ssh 无法启动，**不是认证问题**。解法：用 Windows 原生 OpenSSH——`$env:GIT_SSH="C:\Windows\System32\OpenSSH\ssh.exe"; $env:GIT_SSH_VARIANT="ssh"; git push ...`（2026-08-15 验证有效）。不要用 `core.sshCommand` 配置，git 会用 sh 包装执行、仍触发 msys 崩溃
 - 本机 `192.168.31.40:3322` 有用户自建 Forgejo（用户 yumiko），**无**本仓库镜像，勿混淆
 - 本机无 gh CLI、无 HTTPS 凭据；SSH 是唯一已验证的 push 通道
 
