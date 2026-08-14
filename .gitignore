@@ -9,6 +9,22 @@ obj/
 artifacts/
 publish/
 
+# 测试产物（dotnet test TRX / 覆盖率）
+TestResults/
+*.trx
+coverage/
+*.coverage
+*.coveragexml
+
+# winapp run 松散布局输出（winapp run 默认在输入目录生成 AppX/）
+AppX/
+
+# SQLite 遥测数据（隐私红线：本机负载轨迹，绝不入库）
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
 # 本地配置（不含示例）
 appsettings.local.json
 
