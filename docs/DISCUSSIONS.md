@@ -220,3 +220,53 @@
 ### 6.1 下一步
 - [x] 更新 SPEC v0.2 + 本记录（本会话）
 - [ ] **开工 M1**：core+service 骨架 + CI（Win10/Win11 矩阵）+ WinUI 3 壳 + 遥测采集（schema 定稿）——用户确认后启动
+
+---
+
+## 2026-08-15 会话 ⑦ — M1 开工：骨架 + schema 定稿 + 遥测采集（已完成）
+
+**背景**：用户运行 `/winui-setup` 补齐环境后确认开工 M1。
+
+### 7.1 环境修复（/winui-setup 记录，未来会话必读）
+
+- **winget 在本机 DSH 会话不可直接运行**：DSH 文件沙箱拦截 winget 对 `%LOCALAPPDATA%\Packages\...` 的写入（报 `0x8A150001` 无输出）。解法：DSH 内跑 winget/dotnet build/test 等需要写工作区外 + 联网的命令，一律用 `danger-full-access` 权限。
+- **技能脚本包 ID 修正**：`Microsoft.WinAppCLI`（技能原文）在源中不存在，实际是 **`Microsoft.WinAppCli`**（大小写敏感）。
+- **NuGet 认证失败根因**：受限沙箱阻断 SSPI 凭据访问（"安全包中没有可用的凭证"），完整权限下正常。
+- **UE dotnet PATH 劫持**：系统级 PATH 顺序正确（`C:\Program Files\dotnet` 在 UnrealEngine 之前），DSH 会话内需手动刷新 PATH：`$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')`。
+- 安装结果：winapp 0.6.0 ✅、WinUI 模板 ✅（winui-mvvm 等）、.NET SDK 8.0.424 + 9.0.306 ✅。
+
+### 7.2 M1 已交付
+
+| 交付物 | 位置 | 说明 |
+|---|---|---|
+| 解决方案 | `Cpo.sln` | core + interop + service + tests + app 五工程 |
+| 遥测 schema v1.0 | `docs/schema.md` | **M1 验收点①**：7 类事件字段定稿 + SQLite 落盘形态 |
+| core | `core/Cpo.Core/` | 事件模型、`TelemetryEventSerializer`（camelCase payload，type 独立列）、`ITelemetryStore`/`SqliteTelemetryStore`、`SamplingConfig`、纯逻辑 `CpuUsageCalculator`/`ProcessLifecycleDetector` |
+| interop | `interop/Cpo.Interop/` | `ProcessSampler`（Toolhelp32 + GetProcessTimes/GetProcessMemoryInfo/QueryFullProcessImageNameW）、`SystemSampler`（GetSystemTimes/GlobalMemoryStatusEx）。全部 DllImport（不用 LibraryImport——ByValTStr/FILETIME 封送支持差），`CharSet.Unicode` 必须显式声明 |
+| service | `service/Cpo.Service/` | `TelemetryRecorder`（周期采集 → 事件 → SQLite）+ 控制台宿主（`--interval-ms`/`--retention-days`/`CPO_DB_PATH` 覆盖） |
+| tests | `tests/Cpo.Tests/` | **35 个 xUnit 全通过**：CPU 计算、生命周期 diff、事件序列化契约、SQLite 存储（内存共享库） |
+| app | `app/Cpo.App/` | WinUI 3 壳（M1 直读 SQLite 展示事件流，M2 换 gRPC）。打包运行验证通过 |
+| CI | `.github/workflows/ci.yml` | 编译 + 单测强制，Win10（windows-2022）/Win11（windows-latest）矩阵 |
+
+### 7.3 关键技术决策与坑（M2 必读）
+
+- **事件序列化**：不用 System.Text.Json 多态判别符——net8 下 `[JsonIgnore]` 在抽象属性上不生效、且 `Type` 属性与判别符同名冲突导致反序列化崩溃。改为 `TelemetryEventSerializer`：payload = camelCase 业务字段（无 type），`type` 独立列落盘，反序列化按 type 手动 dispatch。
+- **枚举序列化**：加 `JsonStringEnumConverter(CamelCase)`，schema 枚举值落盘为字符串（`"started"` 而非 `0`）。
+- **SQLite 内存库**：`:memory:` 每连接独立库，测试必须用 `file:xxx?mode=memory&cache=shared`（`CreateInMemory()` 已封装，每实例 GUID 唯一）。
+- **SQLite 查询**：进程过滤用 `json_extract(payload,'$.pid')`（payload 是 camelCase，注意大小写）。
+- **进程采样容错**：svchost 等系统进程普通权限打不开句柄，`Capture` 内所有子步骤单独 try/catch，单进程失败不丢整条快照（path/内存按 null/0 处理，M2 服务以管理员运行后可拿全）。
+- **MVVM 模板默认 C# 13 partial property**（CommunityToolkit.Mvvm 8.4）——net8 SDK 只支持 C# 12，改回字段语法 `[ObservableProperty] private string _x;`（会带 MVVMTK0045 AOT 提示警告，M1 可接受，M3 前评估升级 LangVersion）。
+- **WinUI 构建平台**：sln 默认 Any CPU 对 WinUI 项目无效，必须 `-p:Platform=x64`；winapp run 时不能加 `--no-build`（打包布局需要重新生成 AppxManifest）。
+
+### 7.4 验收结果（M1 验收标准全部达成）
+
+- ✅ **能录制本机负载轨迹**：service 运行 6 秒 → SQLite 写入 2804 条真实事件（sample.cpu 1309 + sample.memory 1309 + process.lifecycle 186），时间范围回放、PID 过滤查询均验证通过。
+- ✅ **schema 定稿**：`docs/schema.md` v1.0，与 core 模型/落盘/回放一致。
+- ✅ **编译 + 单测强制**：`dotnet build` 0 错误；`dotnet test` 35/35 通过；CI workflow 就位。
+- ✅ **WinUI 3 壳**：winapp run 打包启动成功（PID 验证、窗口响应正常）。
+
+### 7.5 下一步（M2）
+- [ ] 回放框架 + 决策日志（`policy.decision`/`policy.action`/`rule.changed` 事件接入）
+- [ ] 基础策略（显式规则优先）+ 前台检测（GUI 侧 SetWinEventHook → 管道上报）
+- [ ] GUI↔服务通信：gRPC over named pipes（M1 已定案）
+- [ ] service 转 Windows 服务形态（LocalSystem）

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # SPEC §6：CI 矩阵覆盖 Win10 与 Win11（Windows App SDK 支持 1809+）
+        os: [windows-2022, windows-latest]  # windows-2022 ≈ Win10 21H2 内核；windows-latest ≈ Win11
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore Cpo.sln -p:Platform=x64
+
+      - name: Build (x64)
+        run: dotnet build Cpo.sln -c Release -p:Platform=x64 --no-restore
+
+      # 铁律（SPEC §12）：每个 PR 必须过 CI（编译 + 单测）；遥测回放测试是核心质量门禁
+      - name: Unit tests
+        run: dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Release -p:Platform=x64 --no-build --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: tests/Cpo.Tests/TestResults/*.trx
