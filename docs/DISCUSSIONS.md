@@ -270,3 +270,28 @@
 - [ ] 基础策略（显式规则优先）+ 前台检测（GUI 侧 SetWinEventHook → 管道上报）
 - [ ] GUI↔服务通信：gRPC over named pipes（M1 已定案）
 - [ ] service 转 Windows 服务形态（LocalSystem）
+
+---
+
+## 2026-08-15 会话 ⑧ — M1 收尾修复（打包虚拟化 + UI 布局）
+
+**背景**：用户实机打开 app 验证，发现两处问题并已修复。
+
+### 8.1 打包应用 LocalAppData 虚拟化（M2 必读，直读 SQLite 的硬伤）
+
+- **现象**：app（MSIX 打包）打开后报"加载失败"。
+- **根因**：打包应用的 `Environment.SpecialFolder.LocalApplicationData` 被虚拟化重定向到
+  `%LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local`，与 service（普通进程）写入的真实用户目录
+  `%LOCALAPPDATA%\Cpo\telemetry.db` **不是同一个路径**。加上 app 侧漏了 `Directory.CreateDirectory`（service 有），首次运行直接异常。
+- **处理**：app 侧补建目录 + 空库/异常友好提示。
+- **对 M2 的启示**：直读 SQLite 在打包/非打包混合架构下路径天然不一致，**必须按 M1 定案切 gRPC over named pipes**（服务推送，app 不碰文件）。M2 实现通信前，本地演示可用 `CPO_DB_PATH` 环境变量 + 把库录到 app 虚拟路径。
+
+### 8.2 UI 布局坑：DataTemplate 内 Grid 列未指定（XAML 常识但易犯）
+
+- **现象**：事件流每一行文字全部叠在一起。
+- **根因**：`DataTemplate` 内 `Grid` 定义了三列，但三个 `TextBlock` 都没写 `Grid.Column`，默认全落在第 0 列。
+- **处理**：显式 `Grid.Column="0/1/2"` + `VerticalAlignment="Center"` + 长文本 `TextTrimming="CharacterEllipsis"`（摘要列 `MaxLines="1"`）。
+
+### 8.3 状态
+- [x] 修复并重新部署验证（用户确认布局正常）
+- [ ] M2 开工

@@ -55,6 +55,10 @@ public partial class MainPageViewModel : ObservableObject
         IsBusy = true;
         try
         {
+            // 与 service 一致：先确保数据库目录存在（打包应用 LocalAppData 会被虚拟化重定向，
+            // 首次运行目录不存在，必须创建）
+            Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
+
             await using var store = new SqliteTelemetryStore(_dbPath);
             await store.InitializeAsync();
 
@@ -75,14 +79,24 @@ public partial class MainPageViewModel : ObservableObject
                 }
             }
 
-            var breakdown = string.Join("  ", byType
-                .OrderByDescending(kv => kv.Value)
-                .Select(kv => $"{kv.Key}={kv.Value}"));
-            StatusText = $"最近 100 条事件已加载（共 {count:N0}）。{breakdown}";
+            if (count == 0)
+            {
+                StatusText = "暂无遥测数据——请先运行遥测服务录制本机负载轨迹（service/Cpo.Service），或点「刷新」重试。";
+                EventCountText = "事件总数: 0";
+            }
+            else
+            {
+                var breakdown = string.Join("  ", byType
+                    .OrderByDescending(kv => kv.Value)
+                    .Select(kv => $"{kv.Key}={kv.Value}"));
+                StatusText = $"最近 100 条事件已加载（共 {count:N0}）。{breakdown}";
+            }
         }
         catch (Exception ex)
         {
-            StatusText = $"加载失败: {ex.Message}（服务未运行？数据库: {_dbPath}）";
+            // M1 已知缺口：打包应用 LocalAppData 虚拟化重定向，与 service（普通进程）路径不一致；
+            // M2 切换 gRPC over named pipes 后由服务推送，不再直读文件
+            StatusText = $"加载失败: {ex.Message}\n（M1 过渡方案直读 SQLite 受打包虚拟化影响，M2 将改为 gRPC 订阅。数据库: {_dbPath}）";
         }
         finally
         {

@@ -75,12 +75,26 @@
                             <ColumnDefinition Width="150" />
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
-                        <TextBlock Text="{x:Bind Time}" Style="{StaticResource CaptionTextBlockStyle}" />
                         <TextBlock
+                            Grid.Column="0"
+                            Text="{x:Bind Time}"
+                            Style="{StaticResource CaptionTextBlockStyle}"
+                            VerticalAlignment="Center"
+                            TextTrimming="CharacterEllipsis" />
+                        <TextBlock
+                            Grid.Column="1"
                             Text="{x:Bind Type}"
                             Style="{StaticResource CaptionTextBlockStyle}"
-                            Opacity="0.8" />
-                        <TextBlock Text="{x:Bind Summary}" Style="{StaticResource BodyTextBlockStyle}" />
+                            Opacity="0.8"
+                            VerticalAlignment="Center"
+                            TextTrimming="CharacterEllipsis" />
+                        <TextBlock
+                            Grid.Column="2"
+                            Text="{x:Bind Summary}"
+                            Style="{StaticResource BodyTextBlockStyle}"
+                            VerticalAlignment="Center"
+                            TextTrimming="CharacterEllipsis"
+                            MaxLines="1" />
                     </Grid>
                 </DataTemplate>
             </ListView.ItemTemplate>
