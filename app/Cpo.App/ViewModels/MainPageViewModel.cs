@@ -67,16 +67,19 @@ public partial class MainPageViewModel : ObservableObject
 
             var byType = new Dictionary<string, long>();
             Events.Clear();
-            var shown = 0;
 
-            await foreach (var evt in store.QueryAsync(new EventQuery { Limit = 200 }))
+            // 取最近 100 条（倒序取最新，再反转为正序展示：时间从上到下递增）
+            var recent = new List<EventRow>(100);
+            await foreach (var evt in store.QueryAsync(new EventQuery { Limit = 100, Descending = true }))
             {
                 byType[evt.Type] = byType.GetValueOrDefault(evt.Type) + 1;
-                if (shown < 100)
-                {
-                    Events.Add(ToRow(evt));
-                    shown++;
-                }
+                recent.Add(ToRow(evt));
+            }
+
+            recent.Reverse();
+            foreach (var row in recent)
+            {
+                Events.Add(row);
             }
 
             if (count == 0)

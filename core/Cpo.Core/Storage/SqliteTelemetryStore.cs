@@ -217,7 +217,7 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
             sql += " WHERE " + string.Join(" AND ", clauses);
         }
 
-        sql += " ORDER BY ts_ms ASC";
+        sql += query.Descending ? " ORDER BY ts_ms DESC" : " ORDER BY ts_ms ASC";
         if (query.Limit is int limit)
         {
             sql += " LIMIT " + limit;

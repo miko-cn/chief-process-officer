@@ -110,6 +110,36 @@ public class SqliteTelemetryStoreTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Query_Descending_ReturnsLatestFirst()
+    {
+        await Store.AppendBatchAsync(Enumerable.Range(0, 10).Select(i =>
+            (TelemetryEvent)new CpuSampleEvent(i * 10, SampleScope.System, null, null, i, i, 8, 1000)));
+
+        var result = await ToListAsync(Store.QueryAsync(new EventQuery { Limit = 3, Descending = true }));
+
+        Assert.Equal(new long[] { 90, 80, 70 }, result.Select(e => e.TsMs));
+    }
+
+    [Fact]
+    public async Task Query_Descending_WithTypeFilter()
+    {
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new CpuSampleEvent(100, SampleScope.System, null, null, 1, 1, 8, 1000),
+            new ProcessLifecycleEvent(200, LifecycleKind.Started, 1, 0, "a.exe", null),
+            new CpuSampleEvent(300, SampleScope.System, null, null, 3, 3, 8, 1000),
+        });
+
+        var result = await ToListAsync(Store.QueryAsync(new EventQuery
+        {
+            Type = TelemetryEventTypes.CpuSample,
+            Descending = true,
+        }));
+
+        Assert.Equal(new long[] { 300, 100 }, result.Select(e => e.TsMs));
+    }
+
+    [Fact]
     public async Task PurgeBefore_RemovesOldEvents()
     {
         await Store.AppendBatchAsync(new TelemetryEvent[]

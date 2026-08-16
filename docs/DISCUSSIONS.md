@@ -341,3 +341,24 @@
 - [ ] 前台检测（GUI 侧 SetWinEventHook → 管道上报，M2 增强：WTSQueryUserToken helper）
 - [ ] GUI↔服务通信：gRPC over named pipes
 - [ ] service 转 Windows 服务形态（LocalSystem）+ 杀软误报对策验证
+
+---
+
+## 2026-08-15 会话 ⑩ — M2 收尾修复：事件列表显示最近而非最早 100 条
+
+**背景**：用户实机验证 M2 时发现 app 事件流显示的是最早 100 条而非最近 100 条。
+
+### 10.1 根因与修复
+
+- **根因**：`EventQuery` 的 SQL 固定 `ORDER BY ts_ms ASC LIMIT N`（升序 = 最早在前），app 直接取前 100 条 → 显示最早事件。
+- **修复**：`EventQuery` 新增 `Descending` 选项（`ORDER BY ts_ms DESC`）；app 用 `Limit=100, Descending=true` 取最近 100 条 → `Reverse()` 后展示（时间从上到下递增，最新在底部，与回放语义一致）。
+- **测试**：新增 2 个（倒序返回最新优先、倒序 + 类型过滤），85/85 通过。
+
+### 10.2 验证
+
+- ✅ 用户实机确认：任务管理器看到压力进程优先级 BelowNormal ↔ Normal 周期切换（规则 5s 超时 + 冷却），功能正常
+- ✅ app 列表显示几秒前的最新事件（policy.decision/action 出现在列表底部）
+
+### 10.3 备注（M3 前）
+
+- 验证期间 db 曾积累 337 万条事件（多次重启 service + 1s 采样间隔 + 300+ 进程）——本地演示前先清库，或调大采样间隔。默认 30 天保留策略 + 1h 清理周期足够生产，但本地反复验证时库会膨胀。

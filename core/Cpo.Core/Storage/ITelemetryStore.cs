@@ -19,6 +19,12 @@ public sealed record EventQuery
 
     /// <summary>返回上限。null = 不限。</summary>
     public int? Limit { get; init; }
+
+    /// <summary>
+    /// 是否按时间倒序（最新在前）。默认 false = 按 ts_ms 升序（回放语义）。
+    /// 取"最近 N 条"时置 true：ORDER BY ts_ms DESC LIMIT N。
+    /// </summary>
+    public bool Descending { get; init; }
 }
 
 /// <summary>
