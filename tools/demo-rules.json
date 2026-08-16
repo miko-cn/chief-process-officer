@@ -1,0 +1,10 @@
+[
+  {
+    "id": "demo.powershell",
+    "processPattern": "powershell",
+    "action": "setPriority",
+    "priorityClass": 16384,
+    "durationMs": 5000,
+    "source": "user"
+  }
+]

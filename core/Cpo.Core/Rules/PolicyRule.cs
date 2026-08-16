@@ -26,7 +26,7 @@ public sealed record PolicyRule
     /// <summary>规则 ID（rule.changed 事件关联用）。</summary>
     public required string Id { get; init; }
 
-    /// <summary>进程名模式（如 "msbuild.exe"、"chrome*.exe"、"*build*"）。</summary>
+    /// <summary>进程名模式（如 "msbuild"、"chrome*"、"*build*"；注意 Process.ProcessName 不含 .exe 后缀）。</summary>
     public required string ProcessPattern { get; init; }
 
     /// <summary>动作类型。</summary>

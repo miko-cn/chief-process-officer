@@ -527,3 +527,31 @@ on:
 ### 14.4 下一步（M3 续）
 - [ ] **对端进程校验**：评估自定义传输层（named pipe + Http2 帧）vs Kestrel 扩展，选定后实现
 - [ ] 其余 M3 续项同 13.6（ProBalance 开关 / 启发式 v1 / 审阅面板增强 / WatchEvents 推送）
+
+## 2026-08-15 会话 ⑮ — 列表闪烁修复（增量合并）+ 自动重连 + 规则进程名坑
+
+**背景**：用户反馈 ① 压力进程不在了、日志没更新 ② 操作日志列表一直在闪。
+
+### 15.1 日志不更新的原因（两点叠加）
+
+1. **压力进程早已清理**（会话⑬演示完杀掉）；当前系统安静 → 无新 policy 事件（`sample.*` 不进操作日志列表，只有状态卡计数在走）
+2. **规则进程名匹配坑（真 bug）**：`Process.ProcessName` **不含 .exe 后缀**，而演示规则文件写的是 `"powershell.exe"` → 永远匹配不上 → 引擎零干预。修复：`tools/demo-rules.json` 改为 `"powershell"`（新建，供演示复用）；顺带修正 `PolicyRule.cs` 注释里 `msbuild.exe` 的误导示例
+3. 验证：压力进程（2× powershell 死循环）→ `policy.decision` + `policy.action(setPriority)` 实时落库，列表恢复更新
+
+### 15.2 列表闪烁根因与修复（增量合并）
+
+- **根因**：每 2s 轮询 `Events.Clear()` + 全量重填 → 即使内容没变也触发整表重绘（闪烁、滚动位置丢失）
+- **修复**（`app/Cpo.App/ViewModels/MainPageViewModel.cs`）：`MergeRows` 增量合并——
+  1. 快速路径：与现有列表逐项比 Key（`ts|type|summary`，事件不可变 → Key 稳定），完全一致 → **零操作**（不触发任何 UI 重绘）
+  2. 有差异：只删"被挤出 Limit 上限"的尾部项、只在缺失处插入（最新在前）
+- **注意**：Key 依赖 ts|type|summary 三元组，同毫秒同类型同内容的重复事件会被视为同一行（实际不可能出现，可接受）
+
+### 15.3 附加修复：App 断线自动重连（实测验证）
+
+- **问题**：app 在 service 停止期间启动 → `StartAsync` 首连失败直接 return → 轮询循环从未启动，永久卡"连接失败"
+- **修复**：首连失败不退出，进入轮询循环，每 2s 重试（per-poll try/catch 已有）
+- **验证**：service 重启后 app 未重启，日志中自动恢复 QueryEvents 轮询（新日志 24 次调用）——呼应决策①"App 探测 + 拉起"的韧性要求
+
+### 15.4 验收
+- ✅ 95/95 测试全绿（本轮为 app/core 注释/工具文件改动，无测试影响面）
+- ✅ 实机：压力进程被降优（decision+action 落库）→ app 增量更新无闪烁；service 重启 app 自动重连

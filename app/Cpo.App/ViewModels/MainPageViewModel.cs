@@ -8,8 +8,12 @@ using Grpc.Net.Client;
 
 namespace Cpo.App.ViewModels;
 
-/// <summary>事件流列表项（UI 展示模型）。</summary>
-public sealed record EventRow(string Time, string Type, string Summary);
+/// <summary>事件流列表项（UI 展示模型）。Key = 内容键（事件写入后不可变 → 稳定，供增量 diff）。</summary>
+public sealed record EventRow(string Time, string Type, string Summary)
+{
+    /// <summary>内容键：ts|type|summary。用于判断两轮拉取之间的差异（相同 = 不重绘）。</summary>
+    public string Key => $"{Time}|{Type}|{Summary}";
+}
 
 /// <summary>
 /// 主页面 ViewModel（M3）：操作日志审阅面板。
@@ -24,7 +28,6 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     private TelemetryService.TelemetryServiceClient? _client;
     private PeriodicTimer? _timer;
     private CancellationTokenSource? _cts;
-    private long _lastTsMs;
     private bool _connected;
 
     public MainPageViewModel(string? pipeName = null)
@@ -62,8 +65,8 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
-            StatusText = $"连接 service 失败: {ex.Message}（service 未运行？）";
-            return;
+            // 初次连接失败不退出：进入下方轮询循环自动重试（service 可能稍后启动/重启）
+            StatusText = $"连接 service 失败: {ex.Message}（service 未运行？重试中…）";
         }
 
         _ = Task.Run(async () =>
@@ -156,7 +159,7 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
         ServiceInfo = $"引擎: {status.EngineMode} | samples: {status.SamplesCount:N0} | 日志: {status.EventLogCount:N0}";
     }
 
-    /// <summary>拉取最新事件（倒序，Limit 20），每轮全量重建列表，最新在最上面。</summary>
+    /// <summary>拉取最新事件（倒序，Limit 20），与现有列表做增量合并：无变化 → 零操作（不闪烁）。</summary>
     private async Task PollAsync()
     {
         var response = await _client!.QueryEventsAsync(new QueryEventsRequest
@@ -166,32 +169,68 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
             Limit = 20,
         }, WithAuth());
 
-        // 响应为倒序（Events[0] = 最新）→ 直接按序重建，列表索引 0 = 最新在最上面。
-        // 全量重建（Limit 20）天然有序、无重复，避免 Insert(0) 造成的逆序 bug。
+        // 响应为倒序（Events[0] = 最新）→ rows 与现有列表同序，可直接按位 diff
         var rows = new List<EventRow>(response.Events.Count);
         foreach (var envelope in response.Events)
         {
             rows.Add(ToRow(envelope));
         }
 
-        if (response.Events.Count > 0)
-        {
-            _lastTsMs = response.Events[0].TsMs;
-        }
-
         var lastRefresh = DateTimeOffset.Now.ToLocalTime().ToString("HH:mm:ss");
         // ObservableCollection 只能在 UI 线程修改 → marshal 回 UI（后台轮询线程不可直接改）
         _uiDispatcher.TryEnqueue(() =>
         {
-            Events.Clear();
-            foreach (var row in rows)
-            {
-                Events.Add(row);
-            }
-
+            MergeRows(rows);
             StatusText = $"已连接 · 最近 {Events.Count} 条操作记录（每 2s 自动刷新 · 最后刷新 {lastRefresh}）";
         });
         _connected = true;
+    }
+
+    /// <summary>
+    /// 增量合并：rows 是权威顺序（最新在前）。无差异 → 不动集合（解决全量重建闪烁）；
+    /// 有差异 → 只增删变化项，滚动位置与可见项尽量保持。
+    /// </summary>
+    private void MergeRows(List<EventRow> rows)
+    {
+        // 快速路径：内容完全一致 → 零操作（不触发任何 UI 重绘）
+        if (rows.Count == Events.Count)
+        {
+            var same = true;
+            for (var i = 0; i < rows.Count; i++)
+            {
+                if (Events[i].Key != rows[i].Key) { same = false; break; }
+            }
+
+            if (same) return;
+        }
+
+        var incoming = new HashSet<string>(rows.Count);
+        foreach (var row in rows)
+        {
+            incoming.Add(row.Key);
+        }
+
+        // 1) 删：现有中已不在最新窗口内的项（新事件把旧事件挤出 Limit 上限）
+        for (var i = Events.Count - 1; i >= 0; i--)
+        {
+            if (!incoming.Contains(Events[i].Key))
+            {
+                Events.RemoveAt(i);
+            }
+        }
+
+        // 2) 增/对齐：逐位检查，缺失处插入（保持最新在前）
+        for (var i = 0; i < rows.Count; i++)
+        {
+            if (i < Events.Count && Events[i].Key == rows[i].Key) continue;
+            Events.Insert(i, rows[i]);
+        }
+
+        // 3) 收尾：残留超长项删除（防御，正常已被 1 覆盖）
+        while (Events.Count > rows.Count)
+        {
+            Events.RemoveAt(Events.Count - 1);
+        }
     }
 
     private static EventRow ToRow(TelemetryEventEnvelope envelope) => new(
