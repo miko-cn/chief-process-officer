@@ -493,3 +493,37 @@ on:
 - [ ] 启发式 v1（CPU 风暴检测，保守参数起步）
 - [ ] 审阅面板增强（按进程过滤/时间线/恢复状态可视化）
 - [ ] WatchEvents 升级为真实流推送（引擎评估时广播，去轮询）
+
+## 2026-08-15 会话 ⑭ — UI 修复（自动刷新+排序）+ 服务生命周期与安全级别定案
+
+**背景**：修复操作日志"最新不在最上 / 不自动刷新"（Q2）；用户拍板 ① Service 生命周期方案 ② 安全级别到对端进程校验为止。
+
+### 14.1 Q2 修复：列表自动刷新 + 最新在最上（已实机验证）
+
+- **根因**：① Descending 查询结果被 `Insert(0)` 倒插（最新反而跑到底）② PeriodicTimer 后台任务直接改 ObservableCollection（跨线程，UI 不刷新）
+- **修复**（`app/Cpo.App/ViewModels/MainPageViewModel.cs`）：
+  - 轮询改为**整表重建**：按 gRPC 响应顺序赋值（Events[0] = 最新），不再 Insert(0)
+  - 捕获 UI DispatcherQueue：集合与 StatusText 全部走 `_uiDispatcher.TryEnqueue`（后台线程只读数据，UI 线程落集合）
+  - 每次轮询独立 try/catch（瞬断不杀轮询任务）；状态卡显示"最后刷新 hh:mm:ss"便于肉眼验证
+- **验证**：刷新时间戳 21:48:11 → 21:48:21 滚动（2s×2 周期）；列表顶部为最新策略事件（21:47:31 → 21:41:55 → 21:41:53 递减）
+- 备注：日志中偶见 "process not found" = 进程已退出但引擎仍在评估残留样本，属正常行为
+
+### 14.2 决策 ①：Service 生命周期 = Windows 服务 + 开机自启 + App 拉起 + 托盘
+
+用户拍板（行业常规，对标 Process Lasso）：
+1. **service 注册为 Windows 服务**（LocalSystem，**开机自动启动**）——M4 安装器（Inno Setup）注册；服务与 App 是否打开无关，引擎全天候常驻
+2. **App 启动探测 + 拉起**：启动时经 gRPC `GetStatus` 探测，未运行则经 SCM 启动 service（开发态先直接启动进程）
+3. **App 支持最小化到托盘**：关窗收托盘不退出，进程仍在用户会话 → 前台检测 hook 照常工作（复用会话⑤结论）
+- 已同步 SPEC §6「服务生命周期」bullet + §8 M4 验收标准
+
+### 14.3 决策 ②：安全级别定案 = 令牌 + 对端进程校验（不做会话令牌）
+
+- **威胁模型回顾**：令牌文件同用户可读（app 需要），同用户恶意进程理论上可读令牌 → 模拟出合法调用
+- **用户拍板：纵深防御做到"对端进程校验"为止**——named pipe `GetNamedPipeClientProcessId` 拿调用方 PID → 校验必须是 Cpo.App.exe（进程路径/签名）；**即使令牌泄露，别的进程也调不动 gRPC**
+- **明确不做**：会话令牌（短期轮换握手）——成本高收益低，到此为止
+- **实现现状**：Kestrel 不暴露对端 PID → 需自定义传输层（自管 named pipe）或降级方案，**M3 内评估实现路径**；当前基线（CurrentUserOnly + 令牌，95/95 测试含认证拒绝）保持有效
+- 已同步 SPEC §6「gRPC 安全基线」bullet + §8 M3 验收标准
+
+### 14.4 下一步（M3 续）
+- [ ] **对端进程校验**：评估自定义传输层（named pipe + Http2 帧）vs Kestrel 扩展，选定后实现
+- [ ] 其余 M3 续项同 13.6（ProBalance 开关 / 启发式 v1 / 审阅面板增强 / WatchEvents 推送）
