@@ -70,6 +70,7 @@ cd app/Cpo.App && winapp run . --detach
 | SQLite 内存库 | 测试用 `file:xxx?mode=memory&cache=shared`（`:memory:` 每连接独立）；**DisposeAsync 的 ClearAllPools 是全局的**——并行测试类要加 `[Collection("NonParallelGrpc")]` 串行 |
 | P/Invoke | 用 `DllImport`（非 LibraryImport），宽字符 API 必须 `CharSet.Unicode` |
 | GetSystemTimes | **kernel 含 idle**——系统 CPU 累计必须 `kernel+user−idle`，否则系统 CPU% 恒≈100%（启发式"饱和≥90%"恒真 → 非饱和期持续误降常驻挤占者如 chrome，会话⑳f 实机教训）；进程级 GetProcessTimes 无此问题 |
+| 进程优先级类传染 | **Windows ProBalance 会降后台进程为 BelowNormal，且子进程继承父进程优先级类**——一旦终端/宿主被降，其启动的一切进程全 BelowNormal；而 `ThreadPriority.Highest` 是相对进程类的（BelowNormal base 6 + Highest = base 8），⑳d 抗饿死防护被抵消。**service/app 必须启动自保 + 周期自检**（`EnsureProcessNormalPriority`：进程类非 Normal 即升回，每评估/轮询轮一次，成本一次 P/Invoke，会话⑳g 实机教训） |
 | 策略输入 | 固定滑动窗口（15s，会话⑳c 放宽——饱和时采样滞后实测超 5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
 | 干预防抖 | 恢复后 DurationMs 内冷却（`_lastRestoredMs`），恢复时刻由调用方传入 |
 | ProBalance 开关 | 执行干预 ⇔ `Mode==Automatic && InterventionEnabled`（volatile 字段）；关闭 = 立即 RestoreAll 并留痕；切换事件 `policy.intervention_toggled`（schema §8）；App ToggleSwitch TwoWay 绑定必须配同步标志（`SyncInterventionEnabled`）防程序刷新误触发 gRPC |

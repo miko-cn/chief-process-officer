@@ -873,3 +873,37 @@ on:
 
 - **"行为怪异"先查 DB 原始值，再怀疑上层**：⑳d 是样本缺失/为 0（采样饿死）→ 数据面；本次是样本恒满（输入语义错）→ 同样是数据面。两层症状相反、根因不同，但排查路径相同：原始数据 vs 用户观察对不上时，问题在采集层
 - **Win32 累计时间类 API 的 idle 陷阱**：GetSystemTimes（kernel 含 idle）要扣；GetProcessTimes（进程）无 idle 概念。今后任何"累计时间"采样都要确认是否含 idle
+
+## 2026-08-17 会话 ⑳g — 进程优先级类传染（Windows ProBalance + 子进程继承）——"Cpo.Service/Cpo.App 为什么是低于正常"
+
+**用户观察**：任务管理器里 Cpo.Service 和 Cpo.App 的优先级都是"低于正常"（BelowNormal），而保护名单明确包含引擎自身——为什么？
+
+### 20g.1 诊断（两条实锤 + 一条推理）
+
+1. **DB 有自降记录但属旧构建**：23:23 有 `heuristic.saturation` 降 Cpo.Service（pid 24504, 0x4000）的记录——那是⑳c 保护名单加入前的旧构建（idle bug 让系统 CPU 恒 100% → 启发式恒 armed → 无自保护的旧引擎把自己降了）。**新构建（23:58 后）零自降记录**——保护名单有效。
+2. **当前进程仍 BelowNormal**：新构建 service（37432）+ app（34268）都是 BelowNormal，但 DB 无降级记录 → 不是我们降的。
+3. **优先级类传染链实锤**：当前 DSH 的 pwsh 自己就是 **BelowNormal**！Windows 子进程**继承父进程优先级类** → 我从 pwsh 启动的一切（Start-Process service、winapp→app）全部继承 BelowNormal。
+
+**源头**：⑳d 的 16 核风暴测试时系统高负载，**Windows ProBalance**（系统后台进程平衡，Vista 起的内置机制）把后台的终端/宿主进程降为 BelowNormal——一旦被降，其启动的所有子进程持续继承，直到显式 SetPriorityClass(Normal)。（任务管理器里"低于正常"最常见来源就是 ProBalance + 继承传染。）
+
+### 20g.2 影响（不只是显示问题）
+
+`ThreadPriority.Highest` 是**相对进程优先级类**的：进程类 BelowNormal（base 6）+ 线程 Highest（+2）= **base 8**——⑳d 的抗饿死修复被系统降级**抵消了一半**（base 8 与 Normal 风暴进程平级竞争，又会饿）。这解释了为什么风暴降级需要"两档"设计的现实：任何时刻进程类都可能被系统压低。
+
+### 20g.3 修复（启动自保 + 周期自检）
+
+- `EnsureProcessNormalPriority()`（service Program.cs + app MainPageViewModel 各一份）：`Process.GetCurrentProcess().PriorityClass != Normal` 则升回 Normal——一次 P/Invoke，尽力而为（设置自己进程类无需管理员）
+- 调用点：service Main 启动时一次 + EvaluateLoop 每轮；app StartAsync 一次 + 轮询线程每轮
+- 语义：对抗 ProBalance 降级 + 继承传染；进程类 Normal（base 8）+ 线程 Highest（+2）= base 10 才是设计值
+
+### 20g.4 验证
+
+- ✅ 父进程（pwsh）BelowNormal 的前提下：新 service（23320）自保升回 **Normal**、新 app（17812）自保升回 **Normal**（此前 37432/34268 全 BelowNormal）
+- ✅ 130/130 测试全绿（Windows 运行时行为，实机验证为主）
+- ✅ 链路活性确认：event_log 实时、ui.foreground 上报、系统 CPU 22.5%（真实值）
+- 环境：service（23320）+ app（17812）运行中，均 Normal
+
+### 20g.5 备注
+
+- 残余抖动可能：ProBalance 在系统高负载时仍可能再次降级 → 自检每 2s 升回（一次 P/Invoke，成本可忽略；抖动只发生在系统本来就在卡的时候，无碍）
+- M4 Windows 服务形态（LocalSystem）无交互式终端，继承传染源头消失，但 ProBalance 对后台服务仍可能触发——自检保留

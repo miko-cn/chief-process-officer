@@ -130,6 +130,11 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
         _client = CreateClient();
         _timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
 
+        // 进程优先级类自保（会话⑳g）：父进程可能被 Windows ProBalance 降为 BelowNormal 且子进程继承
+        // （优先级类传染）——轮询线程 Highest（相对 +2）在 BelowNormal 进程里只有 base 8，抗卡顿要求打折。
+        // 必须进程类 Normal（base 8）+ 线程 Highest（+2）= base 10 才是设计值。轮询循环每轮复查。
+        EnsureProcessNormalPriority();
+
         // 前台监听：hook 事件上报 + 启动时立即上报当前前台（service 侧启发式的前台保护输入）
         _foregroundWatcher.ForegroundChanged += OnForegroundChanged;
         _foregroundWatcher.Start();
@@ -161,6 +166,7 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
                 {
                     try
                     {
+                        EnsureProcessNormalPriority();
                         await PollAsync();
                     }
                     catch (Exception ex)
@@ -289,6 +295,28 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
 
     private static string BuildServiceInfo(ServiceStatus status) =>
         $"引擎: {status.EngineMode} | ProBalance: {(status.InterventionEnabled ? "开" : "关")} | samples: {status.SamplesCount:N0} | 日志: {status.EventLogCount:N0}";
+
+    /// <summary>
+    /// 确保本进程优先级类为 Normal（会话⑳g 自保，与 service 侧同策略）。
+    /// Windows ProBalance 会降后台进程优先级类，且子进程继承父进程类（传染）——
+    /// 进程类 BelowNormal（base 6）+ 线程 Highest（+2）= base 8，抗卡顿要求（会话⑲）打折。
+    /// 自保失败尽力而为（普通用户权限下设置自己进程的优先级类无需管理员）。
+    /// </summary>
+    private static void EnsureProcessNormalPriority()
+    {
+        try
+        {
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
+            if (self.PriorityClass != System.Diagnostics.ProcessPriorityClass.Normal)
+            {
+                self.PriorityClass = System.Diagnostics.ProcessPriorityClass.Normal;
+            }
+        }
+        catch
+        {
+            // 尽力而为：自保失败不中断 UI
+        }
+    }
 
     /// <summary>拉取最新事件（倒序，Limit 20），与现有列表做增量合并：无变化 → 零操作（不闪烁）。</summary>
     private async Task PollAsync()

@@ -39,6 +39,10 @@ internal static class Program
 
         Console.WriteLine("  按 Ctrl+C 停止。");
 
+        // 启动自保：父进程可能是 BelowNormal（优先级类传染，会话⑳g）——尽早升回 Normal，
+        // 否则采样/评估线程 Highest 只有 base 8（⑳d 抗饿死防护被抵消）。EvaluateLoop 每轮还会复查。
+        EnsureProcessNormalPriority();
+
         Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
         await using var store = new SqliteTelemetryStore(dbPath);
         await using var recorder = new TelemetryRecorder(store, config);
@@ -144,6 +148,10 @@ internal static class Program
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(Math.Max(500, intervalMs)));
         while (await timer.WaitForNextTickAsync(ct))
         {
+            // 进程优先级类自保（会话⑳g）：Windows ProBalance 会把后台进程降为 BelowNormal（base 6），
+            // 且子进程继承父进程优先级类（传染）——进程类被降后，采样/评估线程 Highest（相对 +2）
+            // 只有 base 8，⑳d 的抗饿死防护被抵消。每轮自检，非 Normal 即升回（一次 P/Invoke，成本可忽略）。
+            EnsureProcessNormalPriority();
             try
             {
                 await runner.EvaluateAsync(ct);
@@ -152,6 +160,30 @@ internal static class Program
             {
                 Console.Error.WriteLine($"[PolicyRunner] 评估异常: {ex}");
             }
+        }
+    }
+
+    /// <summary>
+    /// 确保本进程优先级类为 Normal（会话⑳g 自保）。
+    /// 背景：Windows ProBalance（系统后台进程平衡）在高负载时把后台进程优先级类降为 BelowNormal；
+    /// 且 Windows 子进程**继承**父进程优先级类（一旦终端/宿主被降，其启动的一切进程都传染 BelowNormal，
+    /// 实机：DSH 宿主被降 → service/app 全 BelowNormal，base 6 + 线程 Highest = base 8，⑳d 修复减半）。
+    /// ThreadPriority.Highest 是相对进程类的，必须进程类 Normal（base 8）+ 线程 Highest（+2）= base 10 才是设计值。
+    /// 自保失败（权限等）尽力而为，不影响主流程。
+    /// </summary>
+    private static void EnsureProcessNormalPriority()
+    {
+        try
+        {
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
+            if (self.PriorityClass != System.Diagnostics.ProcessPriorityClass.Normal)
+            {
+                self.PriorityClass = System.Diagnostics.ProcessPriorityClass.Normal;
+            }
+        }
+        catch
+        {
+            // 尽力而为：自保失败不中断（采样/评估照常，仅抗饿死能力打折）
         }
     }
 
