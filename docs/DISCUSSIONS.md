@@ -605,3 +605,27 @@ on:
 
 ### 17.4 遗留（M4）
 - service 以 LocalSystem 运行时，管道 ACL 需改为"仅交互用户可连"（当前 CurrentUserOnly 在 LocalSystem 下会拒绝用户 App——与 Kestrel gRPC 管道同题，M4 服务化时一并处理）
+
+## 2026-08-16 会话 ⑱ — ProBalance 开关落地（gRPC 控制面 + 引擎干预态切换）
+
+**背景**：会话⑫定案的"ProBalance 式全局开关"（开关只控制干预执行；遥测/日志/service 照常）此前只有产品描述，本会话落地为完整控制面。
+
+### 18.1 设计定案
+
+- **组合语义**：执行干预 ⇔ `Mode == Automatic && InterventionEnabled`。`Mode` 是启动参数（`--engine`），开关是运行时状态；supervised 启动默认关（命令行显式降级时开关不覆盖）
+- **关闭开关 = 立即恢复全部生效干预**（ProBalance 语义：关了就别管我的进程），恢复动作照常留痕 `policy.action`（restore）
+- **新 schema 事件 `policy.intervention_toggled`**（`enabled` + `source`，当前 source 仅 `app`）：开关切换本身可审计，路由冷表 event_log（router fallback 天然覆盖，零改动）
+- App 开关 = `ToggleSwitch` TwoWay 绑定 + **同步标志防死循环**：`SyncInterventionEnabled`（程序侧 GetStatus 刷新/失败回滚时置位）vs `OnIsInterventionEnabledChanged`（用户操作 → gRPC）；失败回滚 UI + Unauthenticated 自动重握手
+- 返回 `ServiceStatus`（切换后立即返回最新状态，App 免二次查询）
+
+### 18.2 验证（全链路实机）
+
+- ✅ 106/106 单测全绿（+6：PolicyRunnerTests 4 个——关不执行/开执行/关时恢复并留痕/开留痕；GrpcNamedPipeTests 2 个——状态往返/落盘事件；新增公共 TestDoubles.cs）
+- ✅ UIA 切换：`winapp ui invoke InterventionSwitch` → 开关 [on]→[off]，ServiceInfo 实时变"ProBalance: 关"，日志列表顶部出现 `ProBalance 开关: 关闭（app）`
+- ✅ DB 落盘：`{"enabled":false,"source":"app","tsMs":...}`（schema JSON 契约原样）
+- ✅ **干预语义实机验证**：开 → 2×隐藏 powershell 风暴 → `policy.action` +2（被干预）；关 → 再跑风暴 → `policy.action` **0 增长**（干预被阻止，遥测/决策日志继续）
+- 收尾：风暴进程已杀，开关恢复 [on]（保持运行环境默认）
+
+### 18.3 备注
+- GetStatus 的 `intervention_enabled` 字段从"Mode==Automatic 的映射"改为真实开关值（此前该字段恒等于引擎模式，现为独立运行时状态）
+- 遗留（M3 剩余）：启发式 v1（CPU 风暴，保守）、审阅面板增强（进程过滤/时间线/恢复状态）、WatchEvents 真推送（当前 500ms 轮询）

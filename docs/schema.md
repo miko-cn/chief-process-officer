@@ -28,6 +28,7 @@
 | `policy.decision` | 策略引擎每次决策 | 引擎（M2 接入，schema 已定） |
 | `policy.action` | 动作执行与恢复 | 执行路径（M2 接入，schema 已定） |
 | `rule.changed` | 规则变更 | 规则管理（M2 接入，schema 已定） |
+| `policy.intervention_toggled` | ProBalance 开关切换 | 引擎控制面（M3 接入，schema 已定） |
 
 ---
 
@@ -127,22 +128,33 @@ GUI 侧 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动产生（见 SPEC
 | `source` | enum `user` \| `suggestion` | ✅ | 变更来源 |
 | `rule` | string(JSON) | ✅ | 规则全文（变更后的状态） |
 
+## 8. policy.intervention_toggled — ProBalance 开关切换
+
+ProBalance 开关（会话⑫定案）：只控制"自动干预执行"，遥测/日志/服务继续运行。
+关闭开关时立即恢复全部生效干预（恢复动作另行产生 `policy.action` restore 事件）。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `tsMs` | long | ✅ | 切换时刻 |
+| `enabled` | bool | ✅ | 切换后的开关状态 |
+| `source` | string | ✅ | 切换来源（当前仅 `app`；未来 CLI/规则建议可扩展） |
+
 ---
 
-## 8. SQLite 落盘形态（v1.1，2026-08-15 双表分层定案）
+## 9. SQLite 落盘形态（v1.1，2026-08-15 双表分层定案）
 
 **分层原则（M3 定案）**：数据按"决策价值衰减速度"分两层——
 高频采样（99% 写入量）价值衰减极快，只存短期 Buffer（够决策 + 最近诊断）；
 低频日志（1% 写入量）价值长期存在，长保留（审阅/诊断/AI 语料）。
 
-### 8.1 事件路由规则
+### 9.1 事件路由规则
 
 | 表 | 事件类型 | 保留期 | 用途 |
 |---|---|---|---|
 | `samples`（热） | `sample.cpu` / `sample.memory` | **1 小时**（默认） | 决策输入（滑动窗口 5s）、"为什么卡"近期快照 |
 | `event_log`（冷） | `process.lifecycle` / `policy.decision` / `policy.action` / `rule.changed` / `ui.foreground` | **30 天**（默认） | 操作日志审阅、长期诊断、未来 AI 语料 |
 
-### 8.2 表结构（两表同构，物理分离）
+### 9.2 表结构（两表同构，物理分离）
 
 ```sql
 CREATE TABLE IF NOT EXISTS samples (
@@ -173,7 +185,7 @@ CREATE INDEX IF NOT EXISTS idx_event_log_type   ON event_log (type);
   - `event_log` 删除 `ts_ms < now - EventLogRetentionMs`（默认 30d）
 - 保留期配置化（`StorageConfig`），可用户配置（SPEC §7 定案）
 
-## 9. 隐私红线（SPEC §7 引用）
+## 10. 隐私红线（SPEC §7 引用）
 
 - 数据默认本地存储，不上云
 - 未来任何上传必须：脱敏（进程名 + 聚合统计，不含路径/窗口标题）＋ 用户主动点击触发

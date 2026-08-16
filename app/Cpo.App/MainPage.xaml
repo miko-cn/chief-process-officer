@@ -44,6 +44,20 @@
                     Style="{StaticResource CaptionTextBlockStyle}"
                     Opacity="0.7"
                     TextWrapping="Wrap" />
+                <!-- ProBalance 开关（会话⑫定案）：只控制自动干预；遥测/日志/服务继续运行 -->
+                <ToggleSwitch
+                    x:Name="InterventionSwitch"
+                    AutomationProperties.AutomationId="InterventionSwitch"
+                    AutomationProperties.Name="ProBalance 自动调节"
+                    Header="ProBalance 自动调节"
+                    OnContent="开"
+                    OffContent="关"
+                    IsOn="{x:Bind ViewModel.IsInterventionEnabled, Mode=TwoWay}" />
+                <TextBlock
+                    Text="关闭后引擎不再自动干预（生效中的干预立即恢复），遥测与操作日志继续记录。"
+                    Style="{StaticResource CaptionTextBlockStyle}"
+                    Opacity="0.6"
+                    TextWrapping="Wrap" />
             </StackPanel>
         </Border>
 

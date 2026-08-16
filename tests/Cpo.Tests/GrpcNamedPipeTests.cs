@@ -1,4 +1,6 @@
 using Cpo.Contracts.Telemetry;
+using Cpo.Core.Engine;
+using Cpo.Core.Rules;
 using Cpo.Core.Storage;
 using Cpo.Core.Telemetry;
 using Cpo.Service;
@@ -21,6 +23,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
     private const string PipeName = "cpo-test-pipe";
     private SessionTokenStore _tokens = null!;
     private SqliteTelemetryStore _store = null!;
+    private PolicyRunner _runner = null!;
     private WebApplication _server = null!;
 
     public async Task InitializeAsync()
@@ -29,9 +32,16 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         await _store.InitializeAsync();
 
         _tokens = new SessionTokenStore();
+        // 控制面注入真实 PolicyRunner（ProBalance 开关状态经它读写）；初始关，测试显式切换
+        var rules = new RuleStore();
+        _runner = new PolicyRunner(_store, new FakeProcessController(), rules, coreCount: 8)
+        {
+            Mode = DecisionMode.Automatic,
+            InterventionEnabled = false,
+        };
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions());
         builder.Services.AddSingleton<ITelemetryStore>(_store);
-        builder.Services.AddSingleton<Func<DecisionMode>>(() => DecisionMode.Automatic);
+        builder.Services.AddSingleton(_runner);
         builder.Services.AddSingleton<TelemetryGrpcService>();
         builder.Services.AddSingleton(_tokens);
         builder.Services.AddGrpc(o => o.Interceptors.Add<AuthInterceptor>());
@@ -48,6 +58,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
     {
         await _server.StopAsync();
         await _server.DisposeAsync();
+        await _runner.DisposeAsync();
         // 注意：不调 SqliteTelemetryStore.DisposeAsync（其 ClearAllPools 会清全局池，
         // 影响并行测试类的共享内存库）。内存库随进程结束回收。
     }
@@ -169,5 +180,43 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         Assert.Equal(2, response.Events.Count);
         Assert.Equal(300, response.Events[0].TsMs);
         Assert.Equal(200, response.Events[1].TsMs);
+    }
+
+    [Fact]
+    public async Task SetInterventionEnabled_TogglesStatus()
+    {
+        var client = CreateClient();
+        var token = IssueToken();
+
+        // 初始关（InitializeAsync 设置）
+        var initial = await client.GetStatusAsync(new GetStatusRequest(), AuthCall(token));
+        Assert.False(initial.InterventionEnabled);
+
+        var on = await client.SetInterventionEnabledAsync(
+            new SetInterventionEnabledRequest { Enabled = true }, AuthCall(token));
+        Assert.True(on.InterventionEnabled);
+
+        var off = await client.SetInterventionEnabledAsync(
+            new SetInterventionEnabledRequest { Enabled = false }, AuthCall(token));
+        Assert.False(off.InterventionEnabled);
+    }
+
+    [Fact]
+    public async Task SetInterventionEnabled_LogsToggleEvent()
+    {
+        var client = CreateClient();
+        var token = IssueToken();
+
+        await client.SetInterventionEnabledAsync(
+            new SetInterventionEnabledRequest { Enabled = false }, AuthCall(token));
+
+        var response = await client.QueryEventsAsync(new QueryEventsRequest
+        {
+            TypePrefix = "policy.",
+        }, AuthCall(token));
+
+        var toggled = Assert.Single(response.Events, e => e.Type == TelemetryEventTypes.InterventionToggled);
+        Assert.Contains("\"enabled\":false", toggled.PayloadJson);   // schema JSON 契约原样
+        Assert.Contains("\"source\":\"app\"", toggled.PayloadJson);
     }
 }

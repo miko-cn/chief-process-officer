@@ -27,6 +27,19 @@ public sealed class PolicyRunner : IAsyncDisposable
     /// <summary>引擎模式（M1 默认监督；按类别升级自动模式 M3 实现）。</summary>
     public DecisionMode Mode { get; set; } = DecisionMode.Supervised;
 
+    /// <summary>
+    /// ProBalance 开关（会话⑫定案）：只控制"自动干预执行"，遥测/日志/服务继续运行。
+    /// 执行干预的条件 = <see cref="Mode"/> == Automatic 且本开关为 true。
+    /// volatile：评估循环（后台任务）与 gRPC 控制面（开关切换）并发读写。
+    /// </summary>
+    private volatile bool _interventionEnabled = true;
+
+    public bool InterventionEnabled
+    {
+        get => _interventionEnabled;
+        set => _interventionEnabled = value;
+    }
+
     /// <summary>最近一次建议（供 UI/日志展示）。</summary>
     public IReadOnlyList<PolicyProposal> LastProposals { get; private set; } = Array.Empty<PolicyProposal>();
 
@@ -95,8 +108,8 @@ public sealed class PolicyRunner : IAsyncDisposable
             events.Add(DecisionLogger.ToDecisionEvent(proposal, Mode));
         }
 
-        // 自动模式：经执行路径执行（监督模式只建议不执行）
-        if (Mode == DecisionMode.Automatic)
+        // 自动模式 + 开关开启：经执行路径执行（监督模式或开关关闭只建议不执行）
+        if (Mode == DecisionMode.Automatic && InterventionEnabled)
         {
             foreach (var proposal in proposals)
             {
@@ -125,6 +138,41 @@ public sealed class PolicyRunner : IAsyncDisposable
         {
             await _store.AppendBatchAsync(events, ct);
         }
+    }
+
+    /// <summary>
+    /// 切换 ProBalance 开关（gRPC 控制面调用）。
+    /// 关闭：立即恢复全部生效干预（ProBalance 语义：关了就别管我的进程），
+    /// 恢复动作与开关切换都写入决策日志（policy.action + policy.intervention_toggled）。
+    /// 遥测/日志/服务继续运行，不受开关影响（会话⑫定案）。
+    /// </summary>
+    public async Task<InterventionToggledEvent> SetInterventionEnabledAsync(
+        bool enabled, string source = "app", CancellationToken ct = default)
+    {
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var events = new List<TelemetryEvent>();
+
+        lock (_gate)
+        {
+            _interventionEnabled = enabled;
+            if (!enabled)
+            {
+                // 恢复动作留痕（复用 ExecutionLog 尾部新增 restore 事件，与 ReapExpired 同模式）
+                var restored = _execution.RestoreAll();
+                var log = _execution.ExecutionLog;
+                for (var i = Math.Max(0, log.Count - restored); i < log.Count; i++)
+                {
+                    if (log[i].Proposal.Trigger == "restore")
+                    {
+                        events.Add(DecisionLogger.ToActionEvent(log[i]));
+                    }
+                }
+            }
+        }
+
+        events.Add(new InterventionToggledEvent(nowMs, enabled, source));
+        await _store.AppendBatchAsync(events, ct);
+        return (InterventionToggledEvent)events[^1];
     }
 
     /// <summary>停止：恢复全部干预（SPEC：引擎退出时自动恢复原值）。</summary>

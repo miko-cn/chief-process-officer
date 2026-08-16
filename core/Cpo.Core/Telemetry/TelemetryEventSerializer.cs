@@ -32,6 +32,7 @@ public static class TelemetryEventSerializer
         TelemetryEventTypes.PolicyDecision => JsonSerializer.Deserialize<PolicyDecisionEvent>(payload, Options)!,
         TelemetryEventTypes.PolicyAction => JsonSerializer.Deserialize<PolicyActionEvent>(payload, Options)!,
         TelemetryEventTypes.RuleChanged => JsonSerializer.Deserialize<RuleChangedEvent>(payload, Options)!,
+        TelemetryEventTypes.InterventionToggled => JsonSerializer.Deserialize<InterventionToggledEvent>(payload, Options)!,
         _ => throw new ArgumentOutOfRangeException(nameof(type), type, "未知事件类型，与 docs/schema.md 契约不符"),
     };
 }

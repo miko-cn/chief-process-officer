@@ -34,6 +34,12 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     /// <summary>会话令牌（门卫管道经对端进程校验后发放，只存内存不落盘）。null = 未握手/已失效。</summary>
     private string? _sessionToken;
 
+    /// <summary>
+    /// 干预开关同步标志：程序侧（GetStatus 刷新/失败回滚）同步 IsInterventionEnabled 时置位，
+    /// 防止 TwoWay 绑定把程序同步误判为用户操作而触发 gRPC 调用（死循环）。
+    /// </summary>
+    private bool _syncingIntervention;
+
     public MainPageViewModel(string? pipeName = null)
     {
         // service 端管道名：cpo-telemetry-<用户名>
@@ -52,6 +58,62 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     private bool _isBusy;
+
+    /// <summary>ProBalance 开关（服务端状态镜像）。TwoWay 绑定 ToggleSwitch；用户切换触发 gRPC 调用。</summary>
+    [ObservableProperty]
+    private bool _isInterventionEnabled;
+
+    /// <summary>
+    /// 程序侧同步开关状态（GetStatus 刷新 / 调用失败回滚）。置同步标志，不触发用户操作路径。
+    /// </summary>
+    public void SyncInterventionEnabled(bool enabled)
+    {
+        _syncingIntervention = true;
+        try
+        {
+            IsInterventionEnabled = enabled;
+        }
+        finally
+        {
+            _syncingIntervention = false;
+        }
+    }
+
+    /// <summary>
+    /// 用户切换开关（ToggleSwitch TwoWay 绑定触发）→ 调 gRPC 控制面。
+    /// 失败回滚 UI 并提示；Unauthenticated 时清令牌（下一轮自动重握手）。
+    /// </summary>
+    partial void OnIsInterventionEnabledChanged(bool value)
+    {
+        if (_syncingIntervention)
+        {
+            return;
+        }
+
+        _ = ApplyInterventionAsync(value);
+    }
+
+    private async Task ApplyInterventionAsync(bool enabled)
+    {
+        try
+        {
+            var status = await _client!.SetInterventionEnabledAsync(
+                new SetInterventionEnabledRequest { Enabled = enabled }, WithAuth());
+            SyncInterventionEnabled(status.InterventionEnabled);
+            ServiceInfo = BuildServiceInfo(status);
+            StatusText = $"已连接 · ProBalance {(status.InterventionEnabled ? "开" : "关")}";
+        }
+        catch (Exception ex)
+        {
+            SyncInterventionEnabled(!enabled);   // 回滚到原状态
+            if (ex is Grpc.Core.RpcException { StatusCode: Grpc.Core.StatusCode.Unauthenticated })
+            {
+                _sessionToken = null;
+            }
+
+            StatusText = $"开关切换失败: {ex.Message}";
+        }
+    }
 
     public ObservableCollection<EventRow> Events { get; } = new();
 
@@ -180,8 +242,12 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     private async Task RefreshStatusAsync()
     {
         var status = await _client!.GetStatusAsync(new GetStatusRequest(), WithAuth());
-        ServiceInfo = $"引擎: {status.EngineMode} | samples: {status.SamplesCount:N0} | 日志: {status.EventLogCount:N0}";
+        SyncInterventionEnabled(status.InterventionEnabled);
+        ServiceInfo = BuildServiceInfo(status);
     }
+
+    private static string BuildServiceInfo(ServiceStatus status) =>
+        $"引擎: {status.EngineMode} | ProBalance: {(status.InterventionEnabled ? "开" : "关")} | samples: {status.SamplesCount:N0} | 日志: {status.EventLogCount:N0}";
 
     /// <summary>拉取最新事件（倒序，Limit 20），与现有列表做增量合并：无变化 → 零操作（不闪烁）。</summary>
     private async Task PollAsync()
@@ -277,6 +343,7 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
             PolicyDecisionEvent d => $"建议: {d.TargetName} → {ActionText(d.ConclusionJson)}（{d.Trigger}）",
             PolicyActionEvent a => $"{ActionKindText(a.Kind)}: {a.TargetName} → {ResultText(a)}",
             RuleChangedEvent r => $"规则 {r.RuleId}: {r.ChangeKind}（{r.Source}）",
+            InterventionToggledEvent t => $"ProBalance 开关: {(t.Enabled ? "开启" : "关闭")}（{t.Source}）",
             _ => evt.ToString() ?? envelope.Type,
         };
     }

@@ -19,6 +19,9 @@ service TelemetryService {
 
   // 服务状态（引擎模式、运行时长、各表事件数）
   rpc GetStatus(GetStatusRequest) returns (ServiceStatus);
+
+  // ProBalance 开关（M3，会话⑫定案）：只控制自动干预执行；遥测/日志/服务继续运行
+  rpc SetInterventionEnabled(SetInterventionEnabledRequest) returns (ServiceStatus);
 }
 
 // ─── 事件信封 ───
@@ -62,6 +65,11 @@ message WatchEventsRequest {
 // ─── 服务状态 ───
 
 message GetStatusRequest {}
+
+// ProBalance 开关请求：enabled = 是否允许自动干预执行
+message SetInterventionEnabledRequest {
+  bool enabled = 1;
+}
 
 message ServiceStatus {
   string engine_mode = 1;    // "automatic" | "supervised"

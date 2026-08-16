@@ -93,3 +93,17 @@ public enum RuleChangeSource
     User,
     Suggestion,
 }
+
+/// <summary>
+/// ProBalance 开关切换事件（schema §8 policy.intervention_toggled）。
+/// 只记录开关状态变化（干预开关 vs 引擎模式是两回事：开关只控制自动干预执行，
+/// 遥测/日志/服务照常运行——会话⑫定案）。
+/// </summary>
+public sealed record InterventionToggledEvent(
+    long TsMs,
+    bool Enabled,
+    string Source) : TelemetryEvent(TsMs)
+{
+    [JsonIgnore]
+    public override string Type => TelemetryEventTypes.InterventionToggled;
+}

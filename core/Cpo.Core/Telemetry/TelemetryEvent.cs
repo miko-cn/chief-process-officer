@@ -15,6 +15,7 @@ public static class TelemetryEventTypes
     public const string PolicyDecision = "policy.decision";
     public const string PolicyAction = "policy.action";
     public const string RuleChanged = "rule.changed";
+    public const string InterventionToggled = "policy.intervention_toggled";
 }
 
 /// <summary>

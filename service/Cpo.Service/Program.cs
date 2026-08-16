@@ -31,6 +31,7 @@ internal static class Program
                           $"samples 保留: {(int)TimeSpan.FromMilliseconds(config.SamplesRetentionMs).TotalMinutes} 分钟 | " +
                           $"event_log 保留: {(int)TimeSpan.FromMilliseconds(config.EventLogRetentionMs).TotalDays} 天");
         Console.WriteLine($"  引擎模式: {(options.Mode == DecisionMode.Automatic ? "自动（执行干预）" : "监督（仅记录，不执行）")}");
+        Console.WriteLine($"  ProBalance 开关: {(options.Mode == DecisionMode.Automatic ? "开（App 可随时切换）" : "关")}");
         if (options.RuleFile is not null)
         {
             Console.WriteLine($"  规则文件: {options.RuleFile}");
@@ -62,9 +63,11 @@ internal static class Program
         }
 
         // 策略运行器：引擎 + 执行路径 + 决策日志
-        var runner = new PolicyRunner(store, ProcessController.CreateController(), rules, Environment.ProcessorCount)
+        // ProBalance 开关初始值：auto 启动默认开，supervised 启动默认关（开关只控制自动干预，遥测照常）
+        await using var runner = new PolicyRunner(store, ProcessController.CreateController(), rules, Environment.ProcessorCount)
         {
             Mode = options.Mode,
+            InterventionEnabled = options.Mode == DecisionMode.Automatic,
         };
 
         using var cts = new CancellationTokenSource();
@@ -88,7 +91,7 @@ internal static class Program
             k.ListenNamedPipe(pipeName, listenOptions => listenOptions.Protocols =
                 Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2));
         grpcBuilder.Services.AddSingleton<ITelemetryStore>(store);
-        grpcBuilder.Services.AddSingleton<Func<DecisionMode>>(() => runner.Mode);
+        grpcBuilder.Services.AddSingleton(runner);
         grpcBuilder.Services.AddSingleton<TelemetryGrpcService>();
         grpcBuilder.Services.AddSingleton(sessionTokens);
         grpcBuilder.Services.AddGrpc(o =>

@@ -7,18 +7,19 @@ namespace Cpo.Service;
 /// <summary>
 /// gRPC 遥测服务实现（gRPC over named pipes，本地 IPC）。
 /// 数据面：QueryEvents（审阅面板查询）/ WatchEvents（动态刷新推送）/ GetStatus。
+/// 控制面：SetInterventionEnabled（ProBalance 开关，会话⑫定案）。
 /// 信封 payload_json 直接复用 schema 契约（TelemetryEventSerializer 格式），不重复定义字段。
 /// </summary>
 public sealed class TelemetryGrpcService : Contracts.Telemetry.TelemetryService.TelemetryServiceBase
 {
     private readonly ITelemetryStore _store;
-    private readonly Func<DecisionMode> _modeProvider;
+    private readonly PolicyRunner _runner;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
 
-    public TelemetryGrpcService(ITelemetryStore store, Func<DecisionMode> modeProvider)
+    public TelemetryGrpcService(ITelemetryStore store, PolicyRunner runner)
     {
         _store = store;
-        _modeProvider = modeProvider;
+        _runner = runner;
     }
 
     public override async Task<QueryEventsResponse> QueryEvents(
@@ -85,12 +86,19 @@ public sealed class TelemetryGrpcService : Contracts.Telemetry.TelemetryService.
     {
         return new ServiceStatus
         {
-            EngineMode = _modeProvider() == DecisionMode.Automatic ? "automatic" : "supervised",
+            EngineMode = _runner.Mode == DecisionMode.Automatic ? "automatic" : "supervised",
             StartedAtMs = _startedAt.ToUnixTimeMilliseconds(),
             SamplesCount = await _store.CountAsync(TelemetryTable.Samples, context.CancellationToken),
             EventLogCount = await _store.CountAsync(TelemetryTable.EventLog, context.CancellationToken),
-            InterventionEnabled = _modeProvider() == DecisionMode.Automatic,
+            InterventionEnabled = _runner.InterventionEnabled,
         };
+    }
+
+    public override async Task<ServiceStatus> SetInterventionEnabled(
+        SetInterventionEnabledRequest request, ServerCallContext context)
+    {
+        await _runner.SetInterventionEnabledAsync(request.Enabled, "app", context.CancellationToken);
+        return await GetStatus(new GetStatusRequest(), context);
     }
 
     private static TelemetryEventEnvelope ToEnvelope(TelemetryEvent evt) => new()
