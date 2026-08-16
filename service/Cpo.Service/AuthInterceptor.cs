@@ -1,24 +1,20 @@
-using System.Security.AccessControl;
 using Grpc.Core;
 using Grpc.Core.Interceptors;
 
 namespace Cpo.Service;
 
-/// <summary>认证配置：连接令牌。</summary>
-public sealed record AuthOptions(string Token);
-
 /// <summary>
-/// gRPC 认证拦截器：校验每个请求 metadata 中的连接令牌（防同用户任意进程直接调用）。
-/// 令牌由 service 启动时生成/加载（%PROGRAMDATA%\Cpo\auth-token，SYSTEM 权限），
-/// app 读取同一文件后经 metadata 携带。
+/// gRPC 认证拦截器（M3 安全第 3 层落地）：校验每个请求 metadata 中的**会话令牌**。
+/// 会话令牌由门卫管道（GatekeeperPipe）在对端进程校验通过后发放，只存内存、短期有效；
+/// 文件令牌已废弃（同用户可读，无法作为有效凭据）。
 /// </summary>
 public sealed class AuthInterceptor : Interceptor
 {
-    private readonly AuthOptions _options;
+    private readonly SessionTokenStore _tokens;
 
-    public AuthInterceptor(AuthOptions options)
+    public AuthInterceptor(SessionTokenStore tokens)
     {
-        _options = options;
+        _tokens = tokens;
     }
 
     public override async Task<TResponse> UnaryServerHandler<TRequest, TResponse>(
@@ -42,29 +38,13 @@ public sealed class AuthInterceptor : Interceptor
         var provided = context.RequestHeaders
             .FirstOrDefault(h => h.Key == AuthConstants.TokenHeaderKey)?.Value;
 
-        if (provided is null || !CryptographicEquals(provided, _options.Token))
+        // 令牌为 256-bit 随机值，字典查找的时序差异无可利用价值（无需恒定时间比较）
+        if (provided is null || !_tokens.Validate(provided))
         {
             throw new RpcException(new Status(
                 StatusCode.Unauthenticated,
-                "无效或缺失连接令牌（仅 Cpo.App 可访问）"));
+                "无效或缺失会话令牌（仅经门卫校验的 Cpo.App 可访问）"));
         }
-    }
-
-    /// <summary>恒定时间比较，避免时序侧信道。</summary>
-    private static bool CryptographicEquals(string a, string b)
-    {
-        if (a.Length != b.Length)
-        {
-            return false;
-        }
-
-        var diff = 0;
-        for (var i = 0; i < a.Length; i++)
-        {
-            diff |= a[i] ^ b[i];
-        }
-
-        return diff == 0;
     }
 }
 
@@ -73,59 +53,4 @@ public static class AuthConstants
 {
     /// <summary>gRPC metadata 令牌头名。</summary>
     public const string TokenHeaderKey = "cpo-auth-token";
-
-    /// <summary>令牌文件路径（%PROGRAMDATA%\Cpo\auth-token）。</summary>
-    public static string TokenFilePath =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Cpo", "auth-token");
-}
-
-/// <summary>连接令牌管理（service 侧：生成/加载）。</summary>
-public static class AuthTokenManager
-{
-    private const int TokenLengthBytes = 32; // 256-bit
-
-    /// <summary>
-    /// 加载或生成令牌。首次运行生成随机 256-bit 令牌并写入
-    /// %PROGRAMDATA%\Cpo\auth-token（ACL 限制为 SYSTEM + 当前用户）。
-    /// 返回令牌字符串。
-    /// </summary>
-    public static string LoadOrCreate()
-    {
-        var path = AuthConstants.TokenFilePath;
-        if (File.Exists(path))
-        {
-            var existing = File.ReadAllText(path).Trim();
-            if (existing.Length >= 32)
-            {
-                return existing;
-            }
-        }
-
-        var token = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(TokenLengthBytes));
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, token);
-
-        // ACL：SYSTEM + 当前用户完全控制，其余拒绝（管理员可读——app 以普通用户运行需读，故含当前用户）
-        try
-        {
-            var security = new FileSecurity(path, System.Security.AccessControl.AccessControlSections.All);
-            security.SetOwner(System.Security.Principal.WindowsIdentity.GetCurrent().User);
-            security.AddAccessRule(new FileSystemAccessRule(
-                System.Security.Principal.WindowsIdentity.GetCurrent().User!,
-                FileSystemRights.Read | FileSystemRights.Write,
-                AccessControlType.Allow));
-            security.AddAccessRule(new FileSystemAccessRule(
-                new System.Security.Principal.SecurityIdentifier(
-                    System.Security.Principal.WellKnownSidType.LocalSystemSid, null),
-                FileSystemRights.FullControl,
-                AccessControlType.Allow));
-            new FileInfo(path).SetAccessControl(security);
-        }
-        catch
-        {
-            // ACL 设置失败不致命（默认 ACL 已限当前用户）
-        }
-
-        return token;
-    }
 }

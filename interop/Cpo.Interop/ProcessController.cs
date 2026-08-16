@@ -138,6 +138,17 @@ public static partial class ProcessController
         }
     }
 
+    /// <summary>取 named pipe 服务端句柄对应的对端（客户端）进程 PID（门卫管道校验用）。失败返回 null。</summary>
+    public static int? GetClientProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipeHandle)
+    {
+        if (Native.GetNamedPipeClientProcessId(pipeHandle, out var pid))
+        {
+            return (int)pid;
+        }
+
+        return null;
+    }
+
     [Flags]
     private enum ProcessAccessFlags : uint
     {
@@ -167,5 +178,10 @@ public static partial class ProcessController
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool SetProcessAffinityMask(
             Microsoft.Win32.SafeHandles.SafeProcessHandle hProcess, nuint dwProcessAffinityMask);
+
+        [DllImport("kernel32.dll", EntryPoint = "GetNamedPipeClientProcessId", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetNamedPipeClientProcessId(
+            Microsoft.Win32.SafeHandles.SafePipeHandle hNamedPipe, out uint lpdwClientProcessId);
     }
 }

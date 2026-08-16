@@ -31,6 +31,9 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? _cts;
     private bool _connected;
 
+    /// <summary>会话令牌（门卫管道经对端进程校验后发放，只存内存不落盘）。null = 未握手/已失效。</summary>
+    private string? _sessionToken;
+
     public MainPageViewModel(string? pipeName = null)
     {
         // service 端管道名：cpo-telemetry-<用户名>
@@ -61,6 +64,7 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
 
         try
         {
+            await EnsureSessionAsync();
             await RefreshStatusAsync();
             await PollAsync();
         }
@@ -83,6 +87,12 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
                     catch (Exception ex)
                     {
                         // 轮询异常不杀任务：记录后继续下一轮（service 可能瞬时不可用）
+                        if (ex is Grpc.Core.RpcException { StatusCode: Grpc.Core.StatusCode.Unauthenticated })
+                        {
+                            // 会话令牌失效（service 重启等）→ 清空，下一轮经门卫重新握手
+                            _sessionToken = null;
+                        }
+
                         _uiDispatcher.TryEnqueue(() =>
                             StatusText = $"刷新失败: {ex.Message}（重试中…）");
                     }
@@ -125,33 +135,46 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
         return client;
     }
 
-    /// <summary>携带连接令牌的调用选项（与 service 端 AuthInterceptor 对应）。</summary>
-    private static CallOptions WithAuth(CancellationToken ct = default)
+    /// <summary>
+    /// 确保持有有效会话令牌：无令牌时先经门卫管道握手（service 侧校验对端进程必须是 Cpo.App.exe）。
+    /// </summary>
+    private async Task EnsureSessionAsync(CancellationToken ct = default)
+    {
+        if (_sessionToken is not null)
+        {
+            return;
+        }
+
+        _sessionToken = await RequestSessionTokenAsync(ct);
+    }
+
+    /// <summary>门卫握手：连接 cpo-gate-&lt;user&gt;，经对端进程校验后领取会话令牌（内存态，不落盘）。</summary>
+    private static async Task<string> RequestSessionTokenAsync(CancellationToken ct)
+    {
+        var gateName = $"cpo-gate-{Environment.UserName}";
+        await using var pipe = new System.IO.Pipes.NamedPipeClientStream(
+            ".", gateName, System.IO.Pipes.PipeDirection.InOut, System.IO.Pipes.PipeOptions.Asynchronous);
+        await pipe.ConnectAsync(TimeSpan.FromSeconds(5), ct);
+        using var reader = new System.IO.StreamReader(pipe);
+        var token = (await reader.ReadLineAsync(ct))?.Trim();
+        if (string.IsNullOrEmpty(token))
+        {
+            throw new InvalidOperationException("门卫拒绝握手（客户端进程不受信任？）");
+        }
+
+        return token;
+    }
+
+    /// <summary>携带会话令牌的调用选项（与 service 端 AuthInterceptor 对应）。</summary>
+    private CallOptions WithAuth(CancellationToken ct = default)
     {
         var headers = new Metadata();
-        var token = ReadToken();
-        if (token is not null)
+        if (_sessionToken is not null)
         {
-            headers.Add("cpo-auth-token", token);
+            headers.Add("cpo-auth-token", _sessionToken);
         }
 
         return new CallOptions(headers, cancellationToken: ct);
-    }
-
-    private static string? ReadToken()
-    {
-        try
-        {
-            // service 生成的令牌文件：%PROGRAMDATA%\Cpo\auth-token（打包 app 可读——文件 ACL 含当前用户）
-            var path = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                "Cpo", "auth-token");
-            return File.Exists(path) ? File.ReadAllText(path).Trim() : null;
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     private async Task RefreshStatusAsync()
@@ -163,6 +186,8 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     /// <summary>拉取最新事件（倒序，Limit 20），与现有列表做增量合并：无变化 → 零操作（不闪烁）。</summary>
     private async Task PollAsync()
     {
+        await EnsureSessionAsync();
+
         var response = await _client!.QueryEventsAsync(new QueryEventsRequest
         {
             TypePrefix = "policy.",   // 操作日志面板：只看决策/动作/规则变更

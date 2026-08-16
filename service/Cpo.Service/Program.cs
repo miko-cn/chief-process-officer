@@ -76,11 +76,12 @@ internal static class Program
         };
 
         // gRPC over named pipes（本地 IPC，GUI↔服务通信）
-        // 安全加固（2026-08-15）：
+        // 安全加固（2026-08-15 会话⑬b + 会话⑰）：
         //   1) CurrentUserOnly=true —— 管道 ACL 只允许当前用户连接（防其他用户/服务）
-        //   2) 连接令牌校验 —— gRPC metadata 携带共享令牌，拦截器校验（防同用户任意进程直接调用）
+        //   2) 会话令牌校验 —— 拦截器校验 metadata 会话令牌（门卫管道签发，防同用户任意进程直接调用）
+        //   3) 门卫管道 —— 握手时 GetNamedPipeClientProcessId 校验对端必须是 Cpo.App.exe（防令牌被读走后冒充）
         var pipeName = $"cpo-telemetry-{Environment.UserName}";
-        var authToken = AuthTokenManager.LoadOrCreate();
+        var sessionTokens = new SessionTokenStore();
         var grpcBuilder = WebApplication.CreateSlimBuilder(new WebApplicationOptions());
         grpcBuilder.WebHost.UseNamedPipes(o => o.CurrentUserOnly = true);
         grpcBuilder.WebHost.ConfigureKestrel(k =>
@@ -89,25 +90,30 @@ internal static class Program
         grpcBuilder.Services.AddSingleton<ITelemetryStore>(store);
         grpcBuilder.Services.AddSingleton<Func<DecisionMode>>(() => runner.Mode);
         grpcBuilder.Services.AddSingleton<TelemetryGrpcService>();
+        grpcBuilder.Services.AddSingleton(sessionTokens);
         grpcBuilder.Services.AddGrpc(o =>
         {
-            // 所有 RPC 方法统一走令牌校验拦截器
+            // 所有 RPC 方法统一走会话令牌校验拦截器
             o.Interceptors.Add<AuthInterceptor>();
         });
-        grpcBuilder.Services.AddSingleton(new AuthOptions(authToken));
         var grpcServer = grpcBuilder.Build();
         grpcServer.MapGrpcService<TelemetryGrpcService>();
         await grpcServer.StartAsync(cts.Token);
-        Console.WriteLine($"  gRPC: \\\\.\\pipe\\{pipeName}（仅当前用户 + 令牌校验）");
+        Console.WriteLine($"  gRPC: \\\\.\\pipe\\{pipeName}（仅当前用户 + 会话令牌校验）");
+
+        // 门卫管道：对端进程校验 → 发放会话令牌（独立任务，随服务生命周期运行）
+        var gate = new GatekeeperPipe(sessionTokens, new TrustedClientValidator());
+        var gateTask = gate.RunAsync(cts.Token);
 
         try
         {
-            // 三个并行任务：采集写库 / 策略评估 / 分层清理
+            // 四个并行任务：采集写库 / 策略评估 / 分层清理 / 门卫握手
             var evaluateTask = EvaluateLoopAsync(runner, config.SystemSampleIntervalMs, cts.Token);
             var purgeTask = PurgeLoopAsync(store, config, cts.Token);
             await recorder.RunAsync(cts.Token);
             await evaluateTask;
             await purgeTask;
+            await gateTask;
         }
         catch (OperationCanceledException)
         {

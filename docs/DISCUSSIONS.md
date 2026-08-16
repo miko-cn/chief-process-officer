@@ -577,3 +577,31 @@ on:
 - **问题链**：① 底部行删除带系统淡出动画，与顶部插入引起的下滑重叠（观感怪）→ ② 手动入场动画（淡入+下移，ContainerContentChanging + Storyboard）尝试保留插入动画，但用户没看到效果（非虚拟化 StackPanel 下容器事件时机不可靠）→ ③ **用户拍板：入场动画也去掉，简洁优先，动画细节留到之后做**
 - **终态**：`ListView.ItemContainerTransitions = 空 TransitionCollection`（禁用系统增删/重定位过渡）+ 无自定义动画——插入、删除、重定位全部瞬时
 - 备注：将来做动画时用非虚拟化面板时容器事件时机需重新验证（本次手动动画未生效可能与此有关，未深究）
+
+## 2026-08-15 会话 ⑰ — 对端进程校验落地：门卫管道 + 内存会话令牌（gRPC 安全第 3 层）
+
+**背景**：用户拍板"安全级别到对端进程校验为止"（会话⑭），本会话完成资料调研（OWASP gRPC 速查表 / grpc 官方认证分层 / Chromium RegistrationServer 案例 / 安恒管道 PID 伪造研究）并落地实现。
+
+### 17.1 决策演进：会话令牌从"明确不做"变为"门卫的发放物"
+
+- 会话⑭ 曾定案"会话令牌（短期轮换）不做"——当时语境是**无 PID 校验的纯令牌轮换握手**（成本高收益低）
+- 落地设计后演进：**对端进程校验（门卫）是发放入口，会话令牌是发放物**——门卫已解决"令牌被偷"问题，令牌无需轮换（12h 长期有效、不落盘），成本收益翻转 → 做
+- 文件令牌（%PROGRAMDATA%\Cpo\auth-token）**整体废弃**：同用户可读，无法作为有效凭据，删除全部机制
+
+### 17.2 实现（三层纵深闭环）
+
+1. **管道 ACL**（已有）：`CurrentUserOnly` 防其他用户
+2. **会话令牌拦截器**（改造）：`AuthInterceptor` 校验 metadata `cpo-auth-token` 必须是 `SessionTokenStore` 里的有效令牌（内存字典，256-bit 随机，默认 12h 过期惰性清理）
+3. **门卫管道**（新增，`service/Cpo.Service/Security/`）：
+   - `GatekeeperPipe`：raw named pipe `cpo-gate-<user>`（CurrentUserOnly），App 握手 → `GetNamedPipeClientProcessId`（新增 P/Invoke，interop 层）取对端 PID → `TrustedClientValidator` 校验（进程存活 + 可执行文件完整路径 = 开发 AppX 或发布安装目录的 Cpo.App.exe，发布版可叠签名）→ 通过写回会话令牌，拒绝写空行
+   - App 侧：`EnsureSessionAsync` 握手（无令牌时）、`WithAuth` 带会话令牌、**Unauthenticated 时清令牌下一轮自动重握手**（service 重启自愈，复用车轮）
+
+### 17.3 验证（全链路实机）
+
+- ✅ 100/100 单测全绿（+3：可信客户端发令牌 / 不可信拒绝 / 令牌过期）
+- ✅ App（Cpo.App.exe）握手：日志 `[Gate] 发放会话令牌 → pid 31156`，后续 gRPC 全部 200
+- ✅ **攻击模拟**：PowerShell（同用户非 App 进程）连门卫 → 回复空行，日志 `[Gate] 拒绝未知客户端 pid=32076`；旧版文件令牌调用 → `Unauthenticated`
+- 结论：即使令牌文件（已废弃）/任何磁盘文件被同用户进程读到，也拿不到会话令牌 → 调不动 gRPC；管理员级攻击在 Windows 信任边界内无解（明确不做）
+
+### 17.4 遗留（M4）
+- service 以 LocalSystem 运行时，管道 ACL 需改为"仅交互用户可连"（当前 CurrentUserOnly 在 LocalSystem 下会拒绝用户 App——与 Kestrel gRPC 管道同题，M4 服务化时一并处理）

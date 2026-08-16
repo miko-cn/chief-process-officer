@@ -19,7 +19,7 @@ namespace Cpo.Tests;
 public class GrpcNamedPipeTests : IAsyncLifetime
 {
     private const string PipeName = "cpo-test-pipe";
-    private const string TestToken = "test-token-0123456789abcdef";
+    private SessionTokenStore _tokens = null!;
     private SqliteTelemetryStore _store = null!;
     private WebApplication _server = null!;
 
@@ -28,11 +28,12 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         _store = SqliteTelemetryStore.CreateInMemory();
         await _store.InitializeAsync();
 
+        _tokens = new SessionTokenStore();
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions());
         builder.Services.AddSingleton<ITelemetryStore>(_store);
         builder.Services.AddSingleton<Func<DecisionMode>>(() => DecisionMode.Automatic);
         builder.Services.AddSingleton<TelemetryGrpcService>();
-        builder.Services.AddSingleton(new AuthOptions(TestToken));
+        builder.Services.AddSingleton(_tokens);
         builder.Services.AddGrpc(o => o.Interceptors.Add<AuthInterceptor>());
         builder.WebHost.UseNamedPipes(o => o.CurrentUserOnly = true);
         builder.WebHost.ConfigureKestrel(k =>
@@ -51,7 +52,10 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         // 影响并行测试类的共享内存库）。内存库随进程结束回收。
     }
 
-    private TelemetryService.TelemetryServiceClient CreateClient(string? token = TestToken)
+    /// <summary>签发自用会话令牌（生产路径是门卫管道签发；测试直接注入存储）。</summary>
+    private string IssueToken() => _tokens.Issue();
+
+    private TelemetryService.TelemetryServiceClient CreateClient()
     {
         // gRPC over named pipes 官方客户端模式（.NET 8）：
         // GrpcChannel.ForAddress + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream
@@ -74,7 +78,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         return new TelemetryService.TelemetryServiceClient(channel);
     }
 
-    private static CallOptions AuthCall(string? token = TestToken)
+    private static CallOptions AuthCall(string? token)
     {
         var headers = new Metadata();
         if (token is not null)
@@ -119,7 +123,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         var response = await client.QueryEventsAsync(new QueryEventsRequest
         {
             TypePrefix = "policy.",
-        }, AuthCall());
+        }, AuthCall(IssueToken()));
 
         var envelope = Assert.Single(response.Events);
         Assert.Equal(TelemetryEventTypes.PolicyDecision, envelope.Type);
@@ -137,7 +141,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         });
 
         var client = CreateClient();
-        var status = await client.GetStatusAsync(new GetStatusRequest(), AuthCall());
+        var status = await client.GetStatusAsync(new GetStatusRequest(), AuthCall(IssueToken()));
 
         Assert.Equal("automatic", status.EngineMode);
         Assert.Equal(1, status.SamplesCount);
@@ -160,7 +164,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
             TypePrefix = "policy.",
             Descending = true,
             Limit = 2,
-        }, AuthCall());
+        }, AuthCall(IssueToken()));
 
         Assert.Equal(2, response.Events.Count);
         Assert.Equal(300, response.Events[0].TsMs);
