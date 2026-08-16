@@ -79,6 +79,11 @@ internal sealed class FakeTelemetryStore : ITelemetryStore
             result = result.Where(e => e.Type.StartsWith(prefix, StringComparison.Ordinal));
         }
 
+        if (query.Type is string exactType)
+        {
+            result = result.Where(e => e.Type == exactType);
+        }
+
         foreach (var evt in result.OrderBy(e => e.TsMs))
         {
             yield return evt;

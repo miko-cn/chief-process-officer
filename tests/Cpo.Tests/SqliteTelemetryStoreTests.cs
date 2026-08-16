@@ -327,6 +327,57 @@ public class SqliteTelemetryStoreTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task Counts_StayConsistent_AcrossAppendAndPurge()
+    {
+        // R3（会话⑳e）：内存计数与 Append/Purge 保持一致（GetStatus 不再 COUNT 全表）
+        await Store.AppendBatchAsync(Enumerable.Range(0, 30)
+            .Select(i => (TelemetryEvent)new CpuSampleEvent(i, SampleScope.System, null, null, i, i * 10, 8, 1000)));
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new PolicyDecisionEvent(1, "cpu.storm", 6, "d.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+        });
+
+        Assert.Equal(30, await Store.CountAsync(TelemetryTable.Samples));
+        Assert.Equal(1, await Store.CountAsync(TelemetryTable.EventLog));
+        Assert.Equal(31, await Store.CountAsync());
+
+        var removed = await Store.PurgeBeforeAsync(TelemetryTable.Samples, 15);
+        Assert.Equal(15, removed);
+        Assert.Equal(15, await Store.CountAsync(TelemetryTable.Samples));
+        Assert.Equal(16, await Store.CountAsync());
+    }
+
+    [Fact]
+    public async Task FileDatabase_EnablesWalJournalMode()
+    {
+        // R1（会话⑳e）：文件库必须 WAL（读写并发不互斥）；内存库不受影响
+        var dbPath = Path.Combine(Path.GetTempPath(), $"cpo-wal-test-{Guid.NewGuid():N}.db");
+        try
+        {
+            await using var store = new SqliteTelemetryStore(dbPath);
+            await store.InitializeAsync();
+
+            await using var conn = new Microsoft.Data.Sqlite.SqliteConnection(
+                $"Data Source={dbPath};Pooling=false");
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "PRAGMA journal_mode";
+            var mode = (string)(await cmd.ExecuteScalarAsync())!;
+            Assert.Equal("wal", mode);
+        }
+        finally
+        {
+            foreach (var f in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                if (File.Exists(f))
+                {
+                    File.Delete(f);
+                }
+            }
+        }
+    }
+
     private static async Task<List<TelemetryEvent>> ToListAsync(IAsyncEnumerable<TelemetryEvent> source)
     {
         var list = new List<TelemetryEvent>();

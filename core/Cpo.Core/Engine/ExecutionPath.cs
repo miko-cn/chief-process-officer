@@ -27,6 +27,14 @@ public sealed record ExecutionEvent(
 /// </summary>
 public sealed class ExecutionPath
 {
+    /// <summary>
+    /// 执行日志内存上限（R6 审计项，2026-08-17 会话⑳e）：原实现无限增长——
+    /// 自动模式 30 天累计数十万条 ExecutionEvent（每条含 proposal + 多个字符串）→ 数百 MB 内存泄漏级增长。
+    /// 日志只用于"最近恢复条数"补写（ReapExpired/SetInterventionEnabledAsync 读尾部），
+    /// 决策/动作的完整留痕在 SQLite（policy.decision/action），此处环形保留最近 N 条即可。
+    /// </summary>
+    private const int MaxExecutionLogEntries = 2000;
+
     private readonly IProcessController _controller;
     private readonly object _gate = new();
     private readonly Dictionary<int, ActiveIntervention> _active = new();
@@ -95,7 +103,7 @@ public sealed class ExecutionPath
             if (original is null)
             {
                 var evt = new ExecutionEvent(proposal, false, "process not found", null, proposal.TsMs);
-                _executionLog.Add(evt);
+                Log(evt);
                 return evt;
             }
 
@@ -115,7 +123,7 @@ public sealed class ExecutionPath
             }
 
             var execEvent = new ExecutionEvent(proposal, result.Succeeded, result.Error, original, proposal.TsMs);
-            _executionLog.Add(execEvent);
+            Log(execEvent);
             return execEvent;
         }
     }
@@ -217,7 +225,7 @@ public sealed class ExecutionPath
 
         var ok = results.All(r => r.Succeeded);
         var evt = new ExecutionEvent(proposal, ok, ok ? null : "restore failed", intervention.OriginalState, proposal.TsMs);
-        _executionLog.Add(evt);
+        Log(evt);
         _active.Remove(intervention.Pid);
         _lastRestoredMs[intervention.Pid] = proposal.TsMs;
         return evt;
@@ -251,4 +259,17 @@ public sealed class ExecutionPath
         existing.Action == proposal.Action
         && existing.TargetPriorityClass == proposal.PriorityClass
         && existing.TargetAffinityMask == proposal.AffinityMask;
+
+    /// <summary>追加执行日志（环形上限：超限丢最旧，O(1) 均摊——频率低，RemoveAt(0) 可接受）。</summary>
+    private void Log(ExecutionEvent evt)
+    {
+        lock (_gate)
+        {
+            _executionLog.Add(evt);
+            if (_executionLog.Count > MaxExecutionLogEntries)
+            {
+                _executionLog.RemoveAt(0);
+            }
+        }
+    }
 }

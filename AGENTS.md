@@ -37,7 +37,7 @@ Cpo.sln
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 
 dotnet build Cpo.sln -c Debug -p:Platform=x64      # WinUI 项目必须显式 x64，AnyCPU 无效
-dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（127/127）才允许提交
+dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（130/130）才允许提交
 
 # service 实机运行（遥测录制 + 策略评估 + gRPC 管道）
 service/Cpo.Service/bin/Debug/net8.0/Cpo.Service.exe [--interval-ms=2000] [--engine=auto|supervised] [--rules=<json>]
@@ -64,6 +64,7 @@ cd app/Cpo.App && winapp run . --detach
 | 事件序列化 | payload = camelCase 业务字段（无 type），type 独立列；用 `TelemetryEventSerializer`，禁用 STJ 多态判别符 |
 | 枚举 JSON | 必须 `JsonStringEnumConverter(CamelCase)`（RuleStore 等） |
 | SQLite 双表 | `samples`（热，1h）+ `event_log`（冷，30d）分层；路由用 `TelemetryTableRouter`；清理循环在 service PurgeLoopAsync |
+| SQLite 并发/性能 | **必须 WAL**（SchemaSql 前置 `PRAGMA journal_mode=WAL; synchronous=NORMAL`）：rollback journal 下写持 EXCLUSIVE 锁阻塞所有读（评估窗口/UI 查询），写慢→评估延迟→决策滞后（会话⑳e）；**purge 必须分批**（`id IN (SELECT id … LIMIT 10000)` 循环），单语句 DELETE 百万行持锁秒级 = 周期性采样停摆；**计数用 store 内存计数**（Initialize 基线 + Append 增 + Purge 减），禁 COUNT 全表（30 天后 event_log 千万行秒级）；评估窗口查询必须带 `Type`/`TypePrefix` 收敛单表（无类型条件走 UNION 全量反序列化） |
 | SQLite 查询 | 取最近 N 条用 `Descending=true`；前缀用 `TypePrefix`；进程过滤用 `json_extract(payload,'$.pid')`；UNION 查询外层包装再 ORDER BY ts_ms；**排序必须带次级键破平**（同 ts_ms 事件：单表 `id` / 跨表 UNION `type`），否则轮询间顺序翻转 → 增量合并把行删掉重插（列表闪烁） |
 | WinUI 小列表增量更新 | 行数有限（如 20~200）的日志列表：ItemsPanel 用非虚拟化 `StackPanel`，避免顶部插入时容器回收导致视口行闪烁；数据源排序必须确定性（见上一条） |
 | SQLite 内存库 | 测试用 `file:xxx?mode=memory&cache=shared`（`:memory:` 每连接独立）；**DisposeAsync 的 ClearAllPools 是全局的**——并行测试类要加 `[Collection("NonParallelGrpc")]` 串行 |

@@ -45,6 +45,24 @@ public class ExecutionPathTests
         }
     }
 
+    [Fact]
+    public void ExecutionLog_IsCapped_AtMaxEntries()
+    {
+        // R6（会话⑳e）：执行日志环形上限 2000 条，防长期运行内存泄漏级增长
+        var controller = new FakeController();
+        var path = new ExecutionPath(controller);
+
+        // 用不存在的 pid 灌入 "process not found" 日志（无干预副作用，快速填充）
+        for (var i = 0; i < 2500; i++)
+        {
+            path.Execute(Proposal(i, $"p{i}.exe", ProposalActionKind.SetPriority, priority: 0x4000));
+        }
+
+        Assert.Equal(2000, path.ExecutionLog.Count);
+        Assert.DoesNotContain(path.ExecutionLog, e => e.Proposal.TargetPid == 0); // 最旧被挤出
+        Assert.Contains(path.ExecutionLog, e => e.Proposal.TargetPid == 2499);    // 最新保留
+    }
+
     private static PolicyProposal Proposal(int pid, string name, ProposalActionKind action,
         int? priority = null, ulong? mask = null, long? duration = null, long ts = 1000) => new()
     {

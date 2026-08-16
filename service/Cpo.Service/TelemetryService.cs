@@ -12,6 +12,12 @@ namespace Cpo.Service;
 /// </summary>
 public sealed class TelemetryGrpcService : Contracts.Telemetry.TelemetryService.TelemetryServiceBase
 {
+    /// <summary>
+    /// 单次查询返回上限（R10 审计项，2026-08-17 会话⑳e）：客户端传大 Limit 会让服务端
+    /// 全表扫描 + 巨型响应经 named pipe 传输（阻塞数据面）。UI 场景最多几百条，10k 足够。
+    /// </summary>
+    private const int MaxQueryLimit = 10_000;
+
     private readonly ITelemetryStore _store;
     private readonly PolicyRunner _runner;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
@@ -32,7 +38,7 @@ public sealed class TelemetryGrpcService : Contracts.Telemetry.TelemetryService.
             Type = string.IsNullOrEmpty(request.Type) ? null : request.Type,
             TypePrefix = string.IsNullOrEmpty(request.TypePrefix) ? null : request.TypePrefix,
             Pid = request.HasPid ? request.Pid : null,
-            Limit = request.HasLimit ? request.Limit : null,
+            Limit = request.HasLimit ? Math.Clamp(request.Limit, 1, MaxQueryLimit) : null,
             Descending = request.Descending,
             Table = request.Table switch
             {

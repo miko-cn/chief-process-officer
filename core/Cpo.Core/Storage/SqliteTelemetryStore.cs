@@ -13,6 +13,19 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _initialized;
 
+    /// <summary>
+    /// 内存计数（R3 审计项，2026-08-17 会话⑳e）：GetStatus/审阅面板不再 COUNT 全表。
+    /// samples 1h 后 ~144 万行、event_log 30 天 ~3000 万行时 COUNT(*) 遍历索引耗时秒级。
+    /// 本 store 是唯一写入口（单进程 service），计数在 Initialize 加载 + Append 递增 + Purge 递减，
+    /// 读方用 Volatile.Read 无锁读（与 QueryAsync 同侧，不加 _gate）。
+    /// </summary>
+    private long _samplesCount;
+    private long _eventLogCount;
+
+    /// <summary>Purge 分批删除的批大小（R2 审计项）：单语句 DELETE 数百万行会持写锁秒级，
+    /// 期间采样写被 _gate 挡住 → 采样停摆（与采样饱和同型的周期雷）。分批把持锁时间压到每批毫秒级。</summary>
+    private const int PurgeBatchSize = 10_000;
+
     /// <summary>连接串（诊断/测试用）。</summary>
     public string ConnectionStringForDebug => _connectionString;
 
@@ -50,6 +63,19 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
 
             await using var conn = await OpenAsync(ct);
             await ExecuteAsync(conn, SchemaSql, ct);
+            // 计数基线：从现有库加载（重启 service 后内存计数从 0 开始，必须读一次）
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT (SELECT COUNT(*) FROM {TelemetryTableRouter.SamplesTableName}), " +
+                                  $"(SELECT COUNT(*) FROM {TelemetryTableRouter.EventLogTableName})";
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    _samplesCount = reader.GetInt64(0);
+                    _eventLogCount = reader.GetInt64(1);
+                }
+            }
+
             _initialized = true;
         }
         finally
@@ -65,6 +91,7 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
         {
             await using var conn = await OpenAsync(ct);
             await InsertAsync(conn, evt, ct);
+            BumpCount(evt, +1);
         }
         finally
         {
@@ -79,13 +106,26 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
         {
             await using var conn = await OpenAsync(ct);
             await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+            var samplesDelta = 0;
+            var logsDelta = 0;
             foreach (var evt in events)
             {
                 ct.ThrowIfCancellationRequested();
                 await InsertAsync(conn, evt, ct, tx);
+                if (TelemetryTableRouter.TableFor(evt.Type) == TelemetryTable.Samples)
+                {
+                    samplesDelta++;
+                }
+                else
+                {
+                    logsDelta++;
+                }
             }
 
             await tx.CommitAsync(ct);
+            // 提交成功后才应用计数增量（失败回滚时计数不动）
+            Interlocked.Add(ref _samplesCount, samplesDelta);
+            Interlocked.Add(ref _eventLogCount, logsDelta);
         }
         finally
         {
@@ -116,6 +156,11 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
 
     public async Task<long> CountAsync(CancellationToken ct = default)
     {
+        if (_initialized)
+        {
+            return Volatile.Read(ref _samplesCount) + Volatile.Read(ref _eventLogCount);
+        }
+
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = $"SELECT (SELECT COUNT(*) FROM {TelemetryTableRouter.SamplesTableName}) " +
@@ -125,6 +170,13 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
 
     public async Task<long> CountAsync(TelemetryTable table, CancellationToken ct = default)
     {
+        if (_initialized)
+        {
+            return table == TelemetryTable.Samples
+                ? Volatile.Read(ref _samplesCount)
+                : Volatile.Read(ref _eventLogCount);
+        }
+
         await using var conn = await OpenAsync(ct);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = $"SELECT COUNT(*) FROM {TelemetryTableRouter.TableName(table)}";
@@ -136,11 +188,41 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
         await _gate.WaitAsync(ct);
         try
         {
+            var tableName = TelemetryTableRouter.TableName(table);
             await using var conn = await OpenAsync(ct);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = $"DELETE FROM {TelemetryTableRouter.TableName(table)} WHERE ts_ms < $ts";
-            cmd.Parameters.AddWithValue("$ts", tsMsBefore);
-            return await cmd.ExecuteNonQueryAsync(ct);
+            var removedTotal = 0L;
+            while (true)
+            {
+                // 分批删除（R2）：每批最多 PurgeBatchSize 行。单语句 DELETE 数百万行
+                // 在单事务中持 EXCLUSIVE 写锁数秒，期间采样/评估写被 _gate 串行挡住 → 采样停摆。
+                // 分批把每批持锁压到毫秒级；最后一批不足批大小即完成。
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText =
+                    $"DELETE FROM {tableName} WHERE id IN " +
+                    $"(SELECT id FROM {tableName} WHERE ts_ms < $ts LIMIT $batch)";
+                cmd.Parameters.AddWithValue("$ts", tsMsBefore);
+                cmd.Parameters.AddWithValue("$batch", PurgeBatchSize);
+                var removed = await cmd.ExecuteNonQueryAsync(ct);
+                removedTotal += removed;
+                if (removed < PurgeBatchSize)
+                {
+                    break;
+                }
+            }
+
+            if (removedTotal > 0)
+            {
+                if (table == TelemetryTable.Samples)
+                {
+                    Interlocked.Add(ref _samplesCount, -removedTotal);
+                }
+                else
+                {
+                    Interlocked.Add(ref _eventLogCount, -removedTotal);
+                }
+            }
+
+            return removedTotal;
         }
         finally
         {
@@ -167,6 +249,19 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
         var conn = new SqliteConnection(_connectionString);
         await conn.OpenAsync(ct);
         return conn;
+    }
+
+    /// <summary>单条写入的内存计数递增（在 _gate 内调用；写失败抛异常时计数不动）。</summary>
+    private void BumpCount(TelemetryEvent evt, long delta)
+    {
+        if (TelemetryTableRouter.TableFor(evt.Type) == TelemetryTable.Samples)
+        {
+            Interlocked.Add(ref _samplesCount, delta);
+        }
+        else
+        {
+            Interlocked.Add(ref _eventLogCount, delta);
+        }
     }
 
     private static async Task ExecuteAsync(SqliteConnection conn, string sql, CancellationToken ct)
@@ -292,6 +387,13 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
     }
 
     private const string SchemaSql = $$"""
+        -- WAL（R1 审计项，2026-08-17 会话⑳e）：rollback journal 模式下写事务持 EXCLUSIVE 锁，
+        -- 期间所有读（评估 15s 窗口查询 / UI 查询）被阻塞；采样写 800+ 行/2s 时读写互相排队，
+        -- 写慢 → 评估延迟 → 决策滞后（与采样饱和同型的"数据面劣化 → 策略失效"链）。
+        -- WAL：写不阻塞读、读不阻塞写；synchronous=NORMAL 在 WAL 下保证崩溃一致性且大幅降 fsync 次数。
+        -- （内存库返回 "memory" 模式不报错；samples 冷表 event_log 同库同 WAL。）
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
         CREATE TABLE IF NOT EXISTS {{TelemetryTableRouter.SamplesTableName}} (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
             ts_ms   INTEGER NOT NULL,

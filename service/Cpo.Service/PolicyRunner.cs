@@ -95,13 +95,21 @@ public sealed class PolicyRunner : IAsyncDisposable
     {
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-        // 滑动窗口查询：每进程最新 CPU 样本重建引擎输入
+        // 滑动窗口查询：每进程最新 CPU 样本重建引擎输入。
+        // Type 精确过滤（R5 审计项，2026-08-17 会话⑳e）：原查询无类型条件 → InferTable 返回 null →
+        // 走 samples+event_log 跨表 UNION + 全量 JSON 反序列化（每 2s 一轮 6000+ 行）。
+        // 评估只用 CPU 样本：Type="sample.cpu" 收敛为单表 + 只 cpu 行（I/O 减半以上），索引 (ts_ms, type) 直命中。
         var latestByPid = new Dictionary<int, ProcessState>();
         var latestTsByPid = new Dictionary<int, long>();
         double systemCpu = 0;
 
         await foreach (var evt in _store.QueryAsync(
-            new EventQuery { FromMs = nowMs - LookbackMs, Limit = 100_000 }, ct))
+            new EventQuery
+            {
+                FromMs = nowMs - LookbackMs,
+                Type = TelemetryEventTypes.CpuSample,
+                Limit = 100_000,
+            }, ct))
         {
             switch (evt)
             {

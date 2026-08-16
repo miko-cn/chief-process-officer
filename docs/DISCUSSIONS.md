@@ -804,3 +804,41 @@ on:
 ### 20d.4 备注
 - 提优先级上限：风暴进程若为 HIGH 类（base 13）仍会饿采样（10 < 13）——v1 接受（99% 场景风暴为 Normal；编译器/工具类少见 HIGH）
 - 采样间隔拉长时 CPU% 计算用真实 elapsed（已有逻辑），不会因间隔放大而失真
+
+## 2026-08-17 会话 ⑳e — 全链路性能审计（"采样饱和"同类雷点排查 + 6 项修复）
+
+**背景**：用户要求全链路排查（查询 / 事件响应等流程），找出会在未来爆发的"采样饱和"同类雷点，并判断是否值得提前修。审计结论：6 项值得立即修（低风险确定性改进），2 项随 M3 面板做，若干观察项。
+
+### 20e.1 审计发现（按风险分级）
+
+🔴 **高（随规模/时间必然爆发）**：
+
+1. **R1 SQLite 未启用 WAL**：rollback journal 模式下写事务持 EXCLUSIVE 锁 → 写期间所有读被阻塞（评估 15s 窗口查询 / UI 查询）；采样写 800+ 行/2s 与读互相排队 → 写慢→评估延迟→决策滞后（与采样饱和同型的"数据面劣化→策略失效"链）。Microsoft.Data.Sqlite 默认 busy timeout 30s——不报错但干等。
+2. **R2 Purge 单语句大 DELETE**：samples 1h 后 ~144 万行，单 DELETE 持写锁秒级 → 采样写被 `_gate` 挡住 → **周期性"采样停摆"**（每 1h 一次）；event_log 30 天后同理（3000 万行）。无 WAL 时回滚 journal 巨大。
+3. **R3 GetStatus 双 COUNT 全表**：`SELECT COUNT(*)` 无 WHERE 遍历索引——30 天后 event_log 3000 万行耗时秒级；M3 面板若每 2s 刷新计数会放大。
+4. **R5 评估查询跨表 UNION 全类型**：`EvaluateAsync` 的 EventQuery 无类型条件 → `InferTable` 返回 null → samples+event_log UNION + 6000+ 行 JSON 反序列化，每 2s 一次。
+5. **R6 `ExecutionPath._executionLog` 无限增长**：每条执行/恢复事件常驻内存（含 proposal + 多个字符串），30 天自动模式数十万条 → 数百 MB 内存泄漏级增长。
+6. **R10 gRPC Limit 无上限**：客户端传大 Limit → 服务端全表扫描 + 巨型响应经 named pipe 传输阻塞数据面。
+
+🟡 **中（随 M3 面板/推送化一并做）**：
+
+- **R4 WatchEvents 假推送 + 同 ts 游标重复交付 bug**：每订阅者每 500ms 轮询 DB；同 ts_ms 的 800 条批量事件 + `ts_ms >= since` 游标 → 同 ts 事件反复重发（饱和场景死循环重复，新事件被 LIMIT 500 挤出）。M3 推送化（内存广播）一并修。
+- **R9 采样路径分配压力 + `QueryFullProcessImageName` 每进程每轮**：400 进程 × 2s = 200 次/秒路径查询 + 大量对象分配 → GC STW 在极端饱和下仍可能打断采样（⑳d 残余同族）。M3 进程表高频数据需求时做 Toolhelp32 一轮化 + path 按需查询（仅新进程查）。
+
+🟢 **观察项（不修）**：R7 `_lastRestoredMs` 惰性（pid 空间 65536 上限，可接受）；R11 QueryAsync 与 Dispose `ClearAllPools` 竞态（停止时序，低风险）；R15 采样写与评估写共享 `_gate`（写-写串行是 SQLite 常态，WAL 后冲突窗口小）；R18 前台事件风暴（OS 已节流）；R22 SQLite 文件碎片（M4 考虑 VACUUM 策略）。
+
+### 20e.2 修复（6 项，全部低风险确定性改进）
+
+1. **R1 WAL**：`SchemaSql` 前置 `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`（内存库返回 "memory" 不报错）。写不阻塞读、读不阻塞写；NORMAL 在 WAL 下保持崩溃一致性且大幅降 fsync。
+2. **R2 分批 purge**：`DELETE ... WHERE id IN (SELECT id FROM ... WHERE ts_ms < $ts LIMIT 10000)` 循环，最后一批不足批大小即完成——每批持锁毫秒级。
+3. **R3 内存计数**：store 内部 `_samplesCount/_eventLogCount`（`Volatile.Read` 无锁读）；Initialize 从 DB 加载基线（重启后不归零）+ Append 递增 + Purge 递减（**提交成功后才应用增量**，失败回滚计数不动）；未初始化时回退 DB COUNT（测试兼容）。
+4. **R5 评估查询收敛**：`Type = TelemetryEventTypes.CpuSample` 精确过滤 → 单表 + 只 cpu 行（I/O 减半以上），索引 `(ts_ms, type)` 直命中。Fake store 同步支持 `Type` 精确过滤。
+5. **R6 日志环形上限**：`MaxExecutionLogEntries = 2000`，`Log()` 超限丢最旧（可重入锁，调用点都在 `_gate` 内）。完整留痕仍在 SQLite（`policy.decision`/`policy.action`）。
+6. **R10 Limit clamp**：服务端 `Math.Clamp(limit, 1, 10_000)`。
+
+### 20e.3 验证与后续
+
+- ✅ 测试 **130/130** 全绿（新增：`Counts_StayConsistent_AcrossAppendAndPurge` / `FileDatabase_EnablesWalJournalMode` / `ExecutionLog_IsCapped_AtMaxEntries`）
+- ✅ 实机：service+app 重启，采样/评估/查询正常
+- 待 M3：R4 WatchEvents 内存广播 + 复合游标（(ts_ms, id)）、R9 采样路径减负（随进程表面板实现）
+- 本次为纯性能/健壮性改进，SPEC 无产品语义变化，未改 schema 契约
