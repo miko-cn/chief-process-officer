@@ -5,6 +5,7 @@ using Xunit;
 namespace Cpo.Tests;
 
 /// <summary>SQLite 存储测试（schema §8 落盘形态）。全部用内存库，避免文件残留。</summary>
+[Collection("NonParallelGrpc")]  // 与 gRPC 测试串行：DisposeAsync 的 ClearAllPools 影响共享内存库
 public class SqliteTelemetryStoreTests : IAsyncLifetime
 {
     private SqliteTelemetryStore? _store;
@@ -149,9 +150,115 @@ public class SqliteTelemetryStoreTests : IAsyncLifetime
             new CpuSampleEvent(300, SampleScope.System, null, null, 3, 3, 8, 1000),
         });
 
-        var removed = await Store.PurgeBeforeAsync(250);
+        var removed = await Store.PurgeBeforeAsync(TelemetryTable.Samples, 250);
         Assert.Equal(2, removed);
         Assert.Equal(1, await Store.CountAsync());
+    }
+
+    // ─── 双表分层（schema §8）───
+
+    [Fact]
+    public async Task Router_AssignsTablesByType()
+    {
+        Assert.Equal(TelemetryTable.Samples, TelemetryTableRouter.TableFor(TelemetryEventTypes.CpuSample));
+        Assert.Equal(TelemetryTable.Samples, TelemetryTableRouter.TableFor(TelemetryEventTypes.MemorySample));
+        Assert.Equal(TelemetryTable.EventLog, TelemetryTableRouter.TableFor(TelemetryEventTypes.ProcessLifecycle));
+        Assert.Equal(TelemetryTable.EventLog, TelemetryTableRouter.TableFor(TelemetryEventTypes.PolicyDecision));
+        Assert.Equal(TelemetryTable.EventLog, TelemetryTableRouter.TableFor(TelemetryEventTypes.PolicyAction));
+        Assert.Equal(TelemetryTable.EventLog, TelemetryTableRouter.TableFor(TelemetryEventTypes.RuleChanged));
+        Assert.Equal(TelemetryTable.EventLog, TelemetryTableRouter.TableFor(TelemetryEventTypes.Foreground));
+    }
+
+    [Fact]
+    public async Task Append_RoutesToCorrectTables()
+    {
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new CpuSampleEvent(100, SampleScope.System, null, null, 1, 1, 8, 1000),
+            new PolicyDecisionEvent(200, "cpu.storm", 6, "d.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+            new MemorySampleEvent(300, SampleScope.System, null, null, null, null, 8000, 16000, 50),
+            new RuleChangedEvent(400, "r1", RuleChangeKind.Added, RuleChangeSource.User, "{}"),
+        });
+
+        Assert.Equal(2, await Store.CountAsync(TelemetryTable.Samples));
+        Assert.Equal(2, await Store.CountAsync(TelemetryTable.EventLog));
+        Assert.Equal(4, await Store.CountAsync());
+    }
+
+    [Fact]
+    public async Task Query_TypeFilter_RoutesToInferredTable()
+    {
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new CpuSampleEvent(100, SampleScope.System, null, null, 1, 1, 8, 1000),
+            new PolicyDecisionEvent(200, "cpu.storm", 6, "d.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+        });
+
+        var cpu = await ToListAsync(Store.QueryAsync(new EventQuery { Type = TelemetryEventTypes.CpuSample }));
+        Assert.Single(cpu);
+        Assert.IsType<CpuSampleEvent>(cpu[0]);
+
+        var decision = await ToListAsync(Store.QueryAsync(new EventQuery { Type = TelemetryEventTypes.PolicyDecision }));
+        Assert.Single(decision);
+        Assert.IsType<PolicyDecisionEvent>(decision[0]);
+    }
+
+    [Fact]
+    public async Task Query_TypePrefix_FiltersAcrossEvents()
+    {
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new PolicyDecisionEvent(100, "cpu.storm", 6, "d.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+            new PolicyActionEvent(200, ActionKind.SetPriority, 7, "e.exe", "{}", "{}", ActionResult.Succeeded, null, null),
+            new RuleChangedEvent(300, "r1", RuleChangeKind.Added, RuleChangeSource.User, "{}"),
+            new CpuSampleEvent(400, SampleScope.System, null, null, 1, 1, 8, 1000),
+        });
+
+        var result = await ToListAsync(Store.QueryAsync(new EventQuery { TypePrefix = "policy." }));
+
+        Assert.Equal(2, result.Count);
+        Assert.All(result, e => Assert.StartsWith("policy.", e.Type));
+    }
+
+    [Fact]
+    public async Task Query_ExplicitTable_OnlyScansThatTable()
+    {
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new CpuSampleEvent(100, SampleScope.System, null, null, 1, 1, 8, 1000),
+            new PolicyDecisionEvent(200, "cpu.storm", 6, "d.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+        });
+
+        var samples = await ToListAsync(Store.QueryAsync(new EventQuery { Table = TelemetryTable.Samples }));
+        Assert.Single(samples);
+        Assert.IsType<CpuSampleEvent>(samples[0]);
+
+        var logs = await ToListAsync(Store.QueryAsync(new EventQuery { Table = TelemetryTable.EventLog }));
+        Assert.Single(logs);
+        Assert.IsType<PolicyDecisionEvent>(logs[0]);
+    }
+
+    [Fact]
+    public async Task Purge_Tiered_OnlyAffectsTargetTable()
+    {
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new CpuSampleEvent(100, SampleScope.System, null, null, 1, 1, 8, 1000),   // samples
+            new CpuSampleEvent(200, SampleScope.System, null, null, 2, 2, 8, 1000),   // samples
+            new PolicyDecisionEvent(100, "cpu.storm", 6, "d.exe", "[]", "{}", DecisionMode.Automatic, "{}"), // event_log
+            new PolicyDecisionEvent(300, "cpu.storm", 6, "d.exe", "[]", "{}", DecisionMode.Automatic, "{}"), // event_log
+        });
+
+        // 只清 samples 的旧数据
+        var removedSamples = await Store.PurgeBeforeAsync(TelemetryTable.Samples, 150);
+        Assert.Equal(1, removedSamples);
+        Assert.Equal(1, await Store.CountAsync(TelemetryTable.Samples));
+        Assert.Equal(2, await Store.CountAsync(TelemetryTable.EventLog)); // event_log 不受影响
+
+        // 再清 event_log
+        var removedLogs = await Store.PurgeBeforeAsync(TelemetryTable.EventLog, 150);
+        Assert.Equal(1, removedLogs);
+        Assert.Equal(1, await Store.CountAsync(TelemetryTable.EventLog));
     }
 
     [Fact]

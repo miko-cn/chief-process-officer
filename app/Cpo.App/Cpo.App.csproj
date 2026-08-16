@@ -49,6 +49,7 @@
     <PropertyGroup> above to opt out.
   -->
   <ItemGroup>
+    <PackageReference Include="Grpc.Net.Client" Version="2.83.0" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7705" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260317003" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
@@ -56,6 +57,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\core\Cpo.Core\Cpo.Core.csproj" />
+    <ProjectReference Include="..\..\contracts\Cpo.Contracts\Cpo.Contracts.csproj" />
   </ItemGroup>
 
   <!--

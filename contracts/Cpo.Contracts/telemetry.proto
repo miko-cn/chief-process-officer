@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package cpo.telemetry;
+
+option csharp_namespace = "Cpo.Contracts.Telemetry";
+
+// CPO 遥测服务契约（gRPC over named pipes，本地进程间通信）。
+// 数据格式原则（2026-08-15 定案）：gRPC 是传输层，不改变存储格式——
+// 事件信封 payload_json 直接复用 docs/schema.md 的 camelCase JSON 契约，
+// 由 core 的 TelemetryEventSerializer 序列化/反序列化，UI 层零改动。
+
+// 遥测服务：查询 + 实时订阅（审阅面板数据源）
+service TelemetryService {
+  // 查询事件（按类型/时间范围/PID/分页，可倒序取最新）
+  rpc QueryEvents(QueryEventsRequest) returns (QueryEventsResponse);
+
+  // 实时订阅事件流（服务端流：新事件持续推送；app 用于动态刷新）
+  rpc WatchEvents(WatchEventsRequest) returns (stream TelemetryEventEnvelope);
+
+  // 服务状态（引擎模式、运行时长、各表事件数）
+  rpc GetStatus(GetStatusRequest) returns (ServiceStatus);
+}
+
+// ─── 事件信封 ───
+
+// 遥测事件信封：type + payload_json（schema §0 契约，payload 为 camelCase JSON）
+message TelemetryEventEnvelope {
+  int64 ts_ms = 1;      // Unix 毫秒 UTC
+  string type = 2;      // 事件类型枚举（schema §0）
+  string payload_json = 3;  // 业务字段 JSON（TelemetryEventSerializer 格式）
+}
+
+// ─── 查询 ───
+
+message QueryEventsRequest {
+  optional int64 from_ms = 1;      // 起始时间（含），缺省不限
+  optional int64 to_ms = 2;        // 结束时间（含），缺省不限
+  string type = 3;                 // 精确类型过滤，空 = 全部
+  string type_prefix = 4;          // 前缀过滤（如 "policy."），与 type 互斥
+  optional int32 pid = 5;          // PID 过滤，缺省不限
+  optional int32 limit = 6;        // 返回上限，缺省不限
+  bool descending = 7;             // true = 最新在前（审阅面板用）
+  enum Table {
+    TABLE_UNSPECIFIED = 0;  // 自动路由
+    SAMPLES = 1;            // 热表（sample.*）
+    EVENT_LOG = 2;          // 冷表（policy.* 等）
+  }
+  Table table = 8;
+}
+
+message QueryEventsResponse {
+  repeated TelemetryEventEnvelope events = 1;
+}
+
+// ─── 实时订阅 ───
+
+message WatchEventsRequest {
+  string type_prefix = 1;   // 只订阅某类前缀（如 "policy."），空 = 全部
+  int64 since_ms = 2;       // 只推送该时间之后的新事件
+}
+
+// ─── 服务状态 ───
+
+message GetStatusRequest {}
+
+message ServiceStatus {
+  string engine_mode = 1;    // "automatic" | "supervised"
+  int64 started_at_ms = 2;   // 服务启动时间
+  int64 samples_count = 3;   // 热表事件数
+  int64 event_log_count = 4; // 冷表事件数
+  bool intervention_enabled = 5;  // ProBalance 开关（M3 后续启用）
+}

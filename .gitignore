@@ -32,3 +32,6 @@ appsettings.local.json
 .idea/
 .vscode/
 .win-dev-skills/
+
+# 本地工具索引（codegraph 等）
+.codegraph/

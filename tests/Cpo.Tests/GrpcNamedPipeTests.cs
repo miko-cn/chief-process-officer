@@ -1,0 +1,133 @@
+using Cpo.Contracts.Telemetry;
+using Cpo.Core.Storage;
+using Cpo.Core.Telemetry;
+using Cpo.Service;
+using Grpc.Net.Client;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Xunit;
+
+namespace Cpo.Tests;
+
+/// <summary>
+/// gRPC over named pipes 集成测试：启动真实服务器 → 客户端经管道查询/订阅。
+/// 禁用并行：SqliteTelemetryStore.DisposeAsync 会 ClearAllPools，影响其他测试类的共享内存库。
+/// </summary>
+[Collection("NonParallelGrpc")]
+public class GrpcNamedPipeTests : IAsyncLifetime
+{
+    private const string PipeName = "cpo-test-pipe";
+    private SqliteTelemetryStore _store = null!;
+    private WebApplication _server = null!;
+
+    public async Task InitializeAsync()
+    {
+        _store = SqliteTelemetryStore.CreateInMemory();
+        await _store.InitializeAsync();
+
+        var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions());
+        builder.Services.AddSingleton<ITelemetryStore>(_store);
+        builder.Services.AddSingleton<Func<DecisionMode>>(() => DecisionMode.Automatic);
+        builder.Services.AddSingleton<TelemetryGrpcService>();
+        builder.Services.AddGrpc();
+        builder.WebHost.ConfigureKestrel(k =>
+            k.ListenNamedPipe(PipeName, listenOptions => listenOptions.Protocols =
+                Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2));
+        _server = builder.Build();
+        _server.MapGrpcService<TelemetryGrpcService>();
+        await _server.StartAsync();
+    }
+
+    public async Task DisposeAsync()
+    {
+        await _server.StopAsync();
+        await _server.DisposeAsync();
+        // 注意：不调 SqliteTelemetryStore.DisposeAsync（其 ClearAllPools 会清全局池，
+        // 影响并行测试类的共享内存库）。内存库随进程结束回收。
+    }
+
+    private TelemetryService.TelemetryServiceClient CreateClient()
+    {
+        // gRPC over named pipes 官方客户端模式（.NET 8）：
+        // GrpcChannel.ForAddress + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream
+        // 参考: https://learn.microsoft.com/aspnet/core/grpc/interprocess-namedpipes
+        var handler = new SocketsHttpHandler
+        {
+            ConnectCallback = async (_, _) =>
+            {
+                var stream = new System.IO.Pipes.NamedPipeClientStream(
+                    ".", PipeName, System.IO.Pipes.PipeDirection.InOut,
+                    System.IO.Pipes.PipeOptions.Asynchronous);
+                await stream.ConnectAsync(TimeSpan.FromSeconds(5), CancellationToken.None);
+                return stream;
+            },
+        };
+        var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+        {
+            HttpHandler = handler,
+        });
+        return new TelemetryService.TelemetryServiceClient(channel);
+    }
+
+    [Fact]
+    public async Task QueryEvents_RoundTripsEvents()
+    {
+        await _store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new CpuSampleEvent(100, SampleScope.System, null, null, 12.5, 100, 8, 1000),
+            new PolicyDecisionEvent(200, "cpu.storm", 42, "msbuild.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+        });
+
+        var client = CreateClient();
+        var response = await client.QueryEventsAsync(new QueryEventsRequest
+        {
+            TypePrefix = "policy.",
+        });
+
+        var envelope = Assert.Single(response.Events);
+        Assert.Equal(TelemetryEventTypes.PolicyDecision, envelope.Type);
+        Assert.Equal(200, envelope.TsMs);
+        Assert.Contains("\"targetPid\":42", envelope.PayloadJson);   // schema JSON 契约原样
+    }
+
+    [Fact]
+    public async Task GetStatus_ReportsCountsAndMode()
+    {
+        await _store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new CpuSampleEvent(100, SampleScope.System, null, null, 1, 1, 8, 1000),
+            new PolicyDecisionEvent(200, "cpu.storm", 42, "a.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+        });
+
+        var client = CreateClient();
+        var status = await client.GetStatusAsync(new GetStatusRequest());
+
+        Assert.Equal("automatic", status.EngineMode);
+        Assert.Equal(1, status.SamplesCount);
+        Assert.Equal(1, status.EventLogCount);
+    }
+
+    [Fact]
+    public async Task QueryEvents_Descending_ReturnsLatestFirst()
+    {
+        await _store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new PolicyDecisionEvent(100, "t1", 1, "a.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+            new PolicyDecisionEvent(200, "t2", 2, "b.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+            new PolicyDecisionEvent(300, "t3", 3, "c.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+        });
+
+        var client = CreateClient();
+        var response = await client.QueryEventsAsync(new QueryEventsRequest
+        {
+            TypePrefix = "policy.",
+            Descending = true,
+            Limit = 2,
+        });
+
+        Assert.Equal(2, response.Events.Count);
+        Assert.Equal(300, response.Events[0].TsMs);
+        Assert.Equal(200, response.Events[1].TsMs);
+    }
+}

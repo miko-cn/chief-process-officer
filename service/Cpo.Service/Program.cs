@@ -4,13 +4,17 @@ using Cpo.Core.Sampling;
 using Cpo.Core.Storage;
 using Cpo.Core.Telemetry;
 using Cpo.Interop;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Cpo.Service;
 
 /// <summary>
-/// CPO 遥测服务宿主（M2）：周期采集本机负载轨迹 → SQLite；策略引擎评估 → 决策日志；
-/// 自动模式下经执行路径干预并自动恢复。
-/// M2 仍以控制台宿主运行（管理员权限），Windows 服务形态 M2 后期/M3。
+/// CPO 遥测服务宿主（M3）：周期采集本机负载轨迹 → SQLite 双表分层；
+/// 策略引擎评估 → 决策日志；自动模式下经执行路径干预并自动恢复。
+/// 分层保留：samples 短保留（1h）+ event_log 长保留（30d），周期清理。
+/// M3 仍以控制台宿主运行（管理员权限），Windows 服务形态后续里程碑。
 /// </summary>
 internal static class Program
 {
@@ -20,10 +24,12 @@ internal static class Program
         var config = options.Config;
         var dbPath = options.DatabasePath;
 
-        Console.WriteLine("CPO 遥测服务 (M2)");
+        Console.WriteLine("CPO 遥测服务 (M3)");
         Console.WriteLine($"  数据库: {dbPath}");
-        Console.WriteLine($"  系统采样: {config.SystemSampleIntervalMs}ms | 保留: {(int)TimeSpan.FromMilliseconds(config.RetentionMs).TotalDays} 天");
-        Console.WriteLine($"  引擎模式: {(options.Mode == DecisionMode.Automatic ? "自动（执行干预）" : "监督（仅建议，不执行）")}");
+        Console.WriteLine($"  系统采样: {config.SystemSampleIntervalMs}ms | " +
+                          $"samples 保留: {(int)TimeSpan.FromMilliseconds(config.SamplesRetentionMs).TotalMinutes} 分钟 | " +
+                          $"event_log 保留: {(int)TimeSpan.FromMilliseconds(config.EventLogRetentionMs).TotalDays} 天");
+        Console.WriteLine($"  引擎模式: {(options.Mode == DecisionMode.Automatic ? "自动（执行干预）" : "监督（仅记录，不执行）")}");
         if (options.RuleFile is not null)
         {
             Console.WriteLine($"  规则文件: {options.RuleFile}");
@@ -43,7 +49,7 @@ internal static class Program
         }
         else
         {
-            // 内置演示规则：编译器/工具风暴降为 BelowNormal（监督模式只建议，安全）
+            // 内置演示规则：编译器/工具风暴降为 BelowNormal（保守）
             rules.Add(new PolicyRule
             {
                 Id = "demo.build-tools",
@@ -68,12 +74,29 @@ internal static class Program
             cts.Cancel();
         };
 
+        // gRPC over named pipes（本地 IPC，GUI↔服务通信）
+        var pipeName = $"cpo-telemetry-{Environment.UserName}";
+        var grpcBuilder = WebApplication.CreateSlimBuilder(new WebApplicationOptions());
+        grpcBuilder.Services.AddSingleton<ITelemetryStore>(store);
+        grpcBuilder.Services.AddSingleton<Func<DecisionMode>>(() => runner.Mode);
+        grpcBuilder.Services.AddSingleton<TelemetryGrpcService>();
+        grpcBuilder.Services.AddGrpc();
+        grpcBuilder.WebHost.ConfigureKestrel(k =>
+            k.ListenNamedPipe(pipeName, listenOptions => listenOptions.Protocols =
+                Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2));
+        var grpcServer = grpcBuilder.Build();
+        grpcServer.MapGrpcService<TelemetryGrpcService>();
+        await grpcServer.StartAsync(cts.Token);
+        Console.WriteLine($"  gRPC: \\\\.\\pipe\\{pipeName}");
+
         try
         {
-            // 采集与策略评估并行：采集写库，策略每周期评估一次
+            // 三个并行任务：采集写库 / 策略评估 / 分层清理
             var evaluateTask = EvaluateLoopAsync(runner, config.SystemSampleIntervalMs, cts.Token);
+            var purgeTask = PurgeLoopAsync(store, config, cts.Token);
             await recorder.RunAsync(cts.Token);
             await evaluateTask;
+            await purgeTask;
         }
         catch (OperationCanceledException)
         {
@@ -81,8 +104,11 @@ internal static class Program
         }
 
         var restored = runner.Shutdown();
+        await grpcServer.StopAsync();
         var count = await store.CountAsync();
-        Console.WriteLine($"已停止。事件总数: {count}，恢复干预: {restored}");
+        var samples = await store.CountAsync(TelemetryTable.Samples);
+        var logs = await store.CountAsync(TelemetryTable.EventLog);
+        Console.WriteLine($"已停止。samples: {samples} | event_log: {logs} | 恢复干预: {restored}");
         return 0;
     }
 
@@ -102,6 +128,30 @@ internal static class Program
         }
     }
 
+    /// <summary>
+    /// 分层清理循环（schema §8.2）：samples 短保留、event_log 长保留。
+    /// </summary>
+    private static async Task PurgeLoopAsync(SqliteTelemetryStore store, SamplingConfig config, CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(config.PurgeIntervalMs));
+        while (await timer.WaitForNextTickAsync(ct))
+        {
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            try
+            {
+                var removedSamples = await store.PurgeBeforeAsync(
+                    TelemetryTable.Samples, nowMs - config.SamplesRetentionMs, ct);
+                var removedLogs = await store.PurgeBeforeAsync(
+                    TelemetryTable.EventLog, nowMs - config.EventLogRetentionMs, ct);
+                Console.WriteLine($"[Purge] samples 清理 {removedSamples} | event_log 清理 {removedLogs}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Purge] 清理异常: {ex.Message}");
+            }
+        }
+    }
+
     private sealed record ServiceOptions(
         SamplingConfig Config,
         string DatabasePath,
@@ -111,7 +161,7 @@ internal static class Program
     private static ServiceOptions LoadOptions(string[] args)
     {
         var config = new SamplingConfig();
-        var mode = DecisionMode.Supervised;
+        var mode = DecisionMode.Automatic;
         string? ruleFile = null;
 
         foreach (var arg in args)
@@ -132,11 +182,17 @@ internal static class Program
                         LifecycleScanIntervalMs = interval,
                     };
                     break;
-                case "--retention-days" when double.TryParse(parts[1], out var days):
-                    config = config with { RetentionMs = (long)(TimeSpan.FromDays(days).TotalMilliseconds) };
+                case "--samples-retention-min" when int.TryParse(parts[1], out var minutes):
+                    config = config with { SamplesRetentionMs = (long)TimeSpan.FromMinutes(minutes).TotalMilliseconds };
                     break;
-                case "--engine" when parts[1] is "auto" or "automatic":
-                    mode = DecisionMode.Automatic;
+                case "--log-retention-days" when double.TryParse(parts[1], out var days):
+                    config = config with { EventLogRetentionMs = (long)TimeSpan.FromDays(days).TotalMilliseconds };
+                    break;
+                case "--purge-interval-ms" when int.TryParse(parts[1], out var purgeMs):
+                    config = config with { PurgeIntervalMs = purgeMs };
+                    break;
+                case "--engine" when parts[1] is "supervised":
+                    mode = DecisionMode.Supervised;
                     break;
                 case "--rules":
                     ruleFile = parts[1];

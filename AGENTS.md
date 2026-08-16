@@ -11,19 +11,20 @@ C# / .NET 8 + WinUI 3，GUI（普通用户）+ 引擎服务（管理员）分离
 **文档层级（新会话必读顺序）**：
 1. `docs/DISCUSSIONS.md` — 讨论记录 + 环境备注 + 每阶段坑（**上下文恢复入口**）
 2. `docs/SPEC.md` — 产品唯一事实来源（定位/铁律/架构/里程碑）
-3. `docs/schema.md` — 遥测事件 schema v1.0（落盘契约，改动需同步代码）
+3. `docs/schema.md` — 遥测事件 schema v1.1（双表分层落盘契约，改动需同步代码）
 
 ## 工程结构
 
 ```
 Cpo.sln
-├─ app/        WinUI 3 壳（薄 UI，普通用户权限；M1 直读 SQLite，M2+ 走 gRPC）
-├─ service/    Cpo.Service 控制台宿主（管理员；TelemetryRecorder 采集 + PolicyRunner 策略）
-├─ core/       Cpo.Core 纯逻辑（遥测模型/存储/规则/引擎/回放，零 OS 依赖，xUnit 全覆盖）
-├─ interop/    Cpo.Interop P/Invoke 隔离层（采样 + 进程控制，依赖 core 的接口）
-├─ tests/      xUnit 单测（当前 85 个全绿 = 质量门禁）
-├─ tools/      演示/诊断工具（ReplayDemo 等）
-└─ docs/       SPEC / DISCUSSIONS / schema / ADR
+├─ app/         WinUI 3 壳（薄 UI，普通用户权限；M3 起经 gRPC 取数，不直读 SQLite）
+├─ service/     Cpo.Service 控制台宿主（管理员；TelemetryRecorder 采集 + PolicyRunner 策略 + gRPC 服务端）
+├─ core/        Cpo.Core 纯逻辑（遥测模型/双表存储/规则/引擎/回放，零 OS 依赖，xUnit 全覆盖）
+├─ interop/     Cpo.Interop P/Invoke 隔离层（采样 + 进程控制，依赖 core 的接口）
+├─ contracts/   Cpo.Contracts gRPC proto 契约（service+app 共用）
+├─ tests/       xUnit 单测（当前 94 个全绿 = 质量门禁）
+├─ tools/       演示/诊断工具（ReplayDemo 等）
+└─ docs/        SPEC / DISCUSSIONS / schema / ADR
 ```
 
 核心架构：确定性屏障 —— `PolicyEngine`（纯逻辑决策）只产建议进 `ProposalBus`，
@@ -36,12 +37,12 @@ Cpo.sln
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 
 dotnet build Cpo.sln -c Debug -p:Platform=x64      # WinUI 项目必须显式 x64，AnyCPU 无效
-dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（85/85）才允许提交
+dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（94/94）才允许提交
 
-# service 实机运行（遥测录制 + 策略评估）
-service/Cpo.Service/bin/Debug/net8.0/Cpo.Service.exe --interval-ms=1000 [--engine=auto] [--rules=<json>]
+# service 实机运行（遥测录制 + 策略评估 + gRPC 管道）
+service/Cpo.Service/bin/Debug/net8.0/Cpo.Service.exe [--interval-ms=2000] [--engine=auto|supervised] [--rules=<json>]
 
-# app 打包运行（绝不能直接跑 exe）
+# app 打包运行（绝不能直接跑 exe；连接管道 cpo-telemetry-<user>）
 cd app/Cpo.App && winapp run . --detach
 ```
 
@@ -62,12 +63,16 @@ cd app/Cpo.App && winapp run . --detach
 |---|---|
 | 事件序列化 | payload = camelCase 业务字段（无 type），type 独立列；用 `TelemetryEventSerializer`，禁用 STJ 多态判别符 |
 | 枚举 JSON | 必须 `JsonStringEnumConverter(CamelCase)`（RuleStore 等） |
-| SQLite 内存库 | 测试用 `file:xxx?mode=memory&cache=shared`（`:memory:` 每连接独立） |
-| SQLite 查询 | 取最近 N 条用 `Descending=true`；进程过滤用 `json_extract(payload,'$.pid')` |
+| SQLite 双表 | `samples`（热，1h）+ `event_log`（冷，30d）分层；路由用 `TelemetryTableRouter`；清理循环在 service PurgeLoopAsync |
+| SQLite 查询 | 取最近 N 条用 `Descending=true`；前缀用 `TypePrefix`；进程过滤用 `json_extract(payload,'$.pid')`；UNION 查询外层包装再 ORDER BY ts_ms |
+| SQLite 内存库 | 测试用 `file:xxx?mode=memory&cache=shared`（`:memory:` 每连接独立）；**DisposeAsync 的 ClearAllPools 是全局的**——并行测试类要加 `[Collection("NonParallelGrpc")]` 串行 |
 | P/Invoke | 用 `DllImport`（非 LibraryImport），宽字符 API 必须 `CharSet.Unicode` |
 | 策略输入 | 固定滑动窗口（5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
 | 干预防抖 | 恢复后 DurationMs 内冷却（`_lastRestoredMs`），恢复时刻由调用方传入 |
-| 打包 app 数据 | LocalAppData 被虚拟化到 `%LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local`，与 service 真实路径不一致——M2+ 用 gRPC 解决 |
+| gRPC named pipes | 契约在 `contracts/Cpo.Contracts`；服务端 `ListenNamedPipe("cpo-telemetry-<user>")`；客户端 `GrpcChannel.ForAddress` + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream（无 TransportType 选项）；**gRPC 是传输层，事件信封 payload_json 复用 schema JSON** |
+| gRPC 服务类命名 | proto 生成的静态类 `TelemetryService` 占用类名 → 实现类用 `TelemetryGrpcService` |
+| WebApplication | 必须 `builder.Services.AddXxx` 后 `builder.Build()`；Services 属性只读 |
+| 打包 app 数据 | LocalAppData 被虚拟化到 `%LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local`——M3 起 app 走 gRPC 不再直读文件 |
 
 ## 工作流约定
 

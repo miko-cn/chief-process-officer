@@ -5,7 +5,7 @@ using Microsoft.UI.Xaml.Controls;
 namespace Cpo.App;
 
 /// <summary>
-/// 主内容页（M1 壳）：遥测状态 + 事件流演示。
+/// 主内容页（M3 审阅面板）：操作日志实时刷新（gRPC 数据源）。
 /// </summary>
 public sealed partial class MainPage : Page
 {
@@ -15,10 +15,16 @@ public sealed partial class MainPage : Page
     {
         InitializeComponent();
         Loaded += OnLoaded;
+        Unloaded += OnUnloaded;
     }
 
     private async void OnLoaded(object sender, RoutedEventArgs e)
     {
-        await ViewModel.InitializeAsync();
+        await ViewModel.StartAsync();
+    }
+
+    private void OnUnloaded(object sender, RoutedEventArgs e)
+    {
+        ViewModel.Dispose();
     }
 }

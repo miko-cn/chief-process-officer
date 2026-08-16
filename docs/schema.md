@@ -129,22 +129,49 @@ GUI 侧 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动产生（见 SPEC
 
 ---
 
-## 8. SQLite 落盘形态
+## 8. SQLite 落盘形态（v1.1，2026-08-15 双表分层定案）
+
+**分层原则（M3 定案）**：数据按"决策价值衰减速度"分两层——
+高频采样（99% 写入量）价值衰减极快，只存短期 Buffer（够决策 + 最近诊断）；
+低频日志（1% 写入量）价值长期存在，长保留（审阅/诊断/AI 语料）。
+
+### 8.1 事件路由规则
+
+| 表 | 事件类型 | 保留期 | 用途 |
+|---|---|---|---|
+| `samples`（热） | `sample.cpu` / `sample.memory` | **1 小时**（默认） | 决策输入（滑动窗口 5s）、"为什么卡"近期快照 |
+| `event_log`（冷） | `process.lifecycle` / `policy.decision` / `policy.action` / `rule.changed` / `ui.foreground` | **30 天**（默认） | 操作日志审阅、长期诊断、未来 AI 语料 |
+
+### 8.2 表结构（两表同构，物理分离）
 
 ```sql
-CREATE TABLE IF NOT EXISTS events (
+CREATE TABLE IF NOT EXISTS samples (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_ms   INTEGER NOT NULL,          -- Unix 毫秒 UTC
     type    TEXT    NOT NULL,          -- 事件类型枚举
     payload TEXT    NOT NULL           -- JSON，含该事件全部业务字段
 );
-CREATE INDEX IF NOT EXISTS idx_events_ts_type ON events (ts_ms, type);
-CREATE INDEX IF NOT EXISTS idx_events_type   ON events (type);
+CREATE INDEX IF NOT EXISTS idx_samples_ts_type ON samples (ts_ms, type);
+CREATE INDEX IF NOT EXISTS idx_samples_type   ON samples (type);
+
+CREATE TABLE IF NOT EXISTS event_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms   INTEGER NOT NULL,
+    type    TEXT    NOT NULL,
+    payload TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_log_ts_type ON event_log (ts_ms, type);
+CREATE INDEX IF NOT EXISTS idx_event_log_type   ON event_log (type);
 ```
 
-- 回放 = `SELECT ... FROM events ORDER BY ts_ms ASC`，按 `type` 过滤即得单一事件流
+- 写入：按事件类型路由到对应表（`TelemetryTableRouter` 单一事实来源）
+- 查询：按类型自动路由；跨表查询（回放/全量统计）用 UNION
+- 回放 = 目标表 `ORDER BY ts_ms ASC`，按 `type` 过滤即得单一事件流
 - 查询进程轨迹 = `WHERE type = 'sample.cpu' AND json_extract(payload, '$.pid') = ?`
-- 保留策略：配置化（`StorageConfig`），默认 30 天，可用户配置
+- **清理循环**：service 周期执行（默认每小时）——
+  - `samples` 删除 `ts_ms < now - SamplesRetentionMs`（默认 1h）
+  - `event_log` 删除 `ts_ms < now - EventLogRetentionMs`（默认 30d）
+- 保留期配置化（`StorageConfig`），可用户配置（SPEC §7 定案）
 
 ## 9. 隐私红线（SPEC §7 引用）
 

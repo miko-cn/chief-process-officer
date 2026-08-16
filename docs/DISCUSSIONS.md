@@ -421,4 +421,64 @@ on:
 
 ### 12.3 状态
 - [x] SPEC §4/§5 已同步（2026-08-15）
-- [ ] M3 按新方向规划开工
+- [x] M3 按新方向规划开工（会话⑬：数据管理 + gRPC + 审阅 UI）
+
+---
+
+## 2026-08-15 会话 ⑬ — M3 第一阶段：双表数据分层 + gRPC over named pipes + 操作日志审阅面板
+
+**背景**：用户拍板 ① 数据分层双表（高频采样短 Buffer + 低频日志长保留）② 提前接 gRPC ③ 操作日志动态刷新（最新在最上）。
+
+### 13.1 双表数据分层（schema v1.1，docs/schema.md §8）
+
+| 表 | 事件 | 保留 | 用途 |
+|---|---|---|---|
+| `samples`（热） | sample.cpu / sample.memory | 1 小时（默认） | 决策输入（5s 滑动窗口）+ 近期诊断 |
+| `event_log`（冷） | lifecycle / policy.* / rule.changed / ui.foreground | 30 天（默认） | 审阅/长期诊断/AI 语料 |
+
+- 路由：`TelemetryTableRouter`（core/Storage，单一事实来源，测试覆盖 7 类事件归属）
+- 清理：service `PurgeLoopAsync` 每 PurgeIntervalMs（默认 1h）分级 DELETE（**M2 遗留缺陷：PurgeBeforeAsync 从未被调用，库膨胀到 337 万条的根因——现已接入**）
+- 采样默认回 2s（SPEC 默认）
+- 实测分布：samples 30006 vs event_log 464（98.5% vs 1.5%），数据量问题根治
+
+### 13.2 gRPC over named pipes（定案落地）
+
+- **契约**：`contracts/Cpo.Contracts/telemetry.proto`（新工程，service+app 共用，GrpcServices=Both）
+  - `QueryEvents`（类型/前缀/PID/时间范围/分页/倒序）
+  - `WatchEvents`（服务端流，M3 简化=轮询拉取，后续可升级内存广播）
+  - `GetStatus`（引擎模式/双表计数）
+- **事件信封**：`{ ts_ms, type, payload_json }`——payload_json 直接复用 schema JSON 契约（TelemetryEventSerializer），**gRPC 是传输层不改存储格式**（M3 定案）
+- **服务端**：Grpc.AspNetCore + `ListenNamedPipe("cpo-telemetry-<user>")`（Kestrel Http2）
+- **客户端**：`GrpcChannel.ForAddress("http://localhost")` + `SocketsHttpHandler.ConnectCallback` 返回 `NamedPipeClientStream`（官方模式，见[微软文档](https://learn.microsoft.com/aspnet/core/grpc/interprocess-namedpipes)）
+- 管道名含用户名避免多用户冲突
+
+### 13.3 app 审阅面板（M3 UI 第一版）
+
+- MainPage 改为「操作日志」：只查 `policy.` 前缀事件，**最新在最上面**（Descending + Insert(0)）
+- **动态刷新**：每 2s 轮询（PeriodicTimer），新事件插顶部，截断 200 条
+- 摘要人性化：`降优先级: powershell → 成功（already active）` / `恢复原值: ...` / `规则 xxx: added`
+- 数据源 gRPC，**根治 M1 打包虚拟化路径问题**（app 不再直读 SQLite）
+- 状态卡片显示引擎模式 + 双表计数
+
+### 13.4 坑与决策（M3 后续必读）
+
+1. **gRPC 生成类命名冲突**：proto `service TelemetryService` 生成静态类 `TelemetryService`，实现类不能同名 → 实现类名 `TelemetryGrpcService`
+2. **CreateSlimBuilder 顺序**：必须 `builder.Services.AddSingleton` 后再 `builder.Build()`；`WebApplication.Services` 是 IServiceProvider 只读
+3. **named pipe 客户端没有 TransportType 选项**：官方做法是 SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream（容易踩的坑）
+4. **测试并行冲突**：SqliteTelemetryStore.DisposeAsync 的 `ClearAllPools` 是全局的，会杀掉其他测试类的共享内存库（`no such table: event_log`）→ 两个测试类加 `[Collection("NonParallelGrpc")]` 串行
+5. **UNION 查询不能直接 ORDER BY ts_ms**：UNION 结果集无该列 → 每支子查询带 ts_ms，外层包装 `(SELECT type,payload,ts_ms ... UNION ALL ...) ORDER BY ts_ms`
+6. **双表 CountAsync 签名变化**：`CountAsync(TelemetryTable)` / `PurgeBeforeAsync(TelemetryTable, ts)`，旧单参版本已删
+7. **EventQuery 增加 TypePrefix**（"policy." 前缀）与 Table 显式指定，审阅面板按前缀查询
+
+### 13.5 验收结果
+
+- ✅ 94/94 单测全绿（新增：双表路由/前缀查询/显式表/分级清理/gRPC 管道 3 项集成）
+- ✅ 实机端到端：service（gRPC 管道）→ 压力进程降优 → app 显示「已连接 · 最近 20 条操作记录（每 2s 自动刷新）」+ 干预记录实时出现
+- ✅ 双表计数验证：samples 30006 / event_log 464（数据分层生效）
+- ✅ 库大小问题根治（清理循环接入 + 采样回 2s + 分层保留）
+
+### 13.6 下一步（M3 续）
+- [ ] ProBalance 开关（app → service 控制面，gRPC SetInterventionEnabled，运行时切换引擎态）
+- [ ] 启发式 v1（CPU 风暴检测，保守参数起步）
+- [ ] 审阅面板增强（按进程过滤/时间线/恢复状态可视化）
+- [ ] WatchEvents 升级为真实流推送（引擎评估时广播，去轮询）
