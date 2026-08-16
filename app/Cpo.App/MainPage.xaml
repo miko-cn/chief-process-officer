@@ -54,6 +54,10 @@
             ItemsSource="{x:Bind ViewModel.Events, Mode=OneWay}"
             AutomationProperties.AutomationId="EventsList"
             AutomationProperties.Name="操作日志">
+            <ListView.ItemContainerTransitions>
+                <!-- 日志视图：禁用增删/重定位过渡动画——否则底部行淡出会与顶部插入的下滑动画重叠 -->
+                <TransitionCollection />
+            </ListView.ItemContainerTransitions>
             <ListView.ItemsPanel>
                 <ItemsPanelTemplate>
                     <StackPanel />
