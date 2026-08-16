@@ -103,18 +103,17 @@ public class HeuristicTests
     }
 
     [Fact]
-    public void SkipsForegroundProcessTree()
+    public void ForegroundChildProcess_StandardDowngrade()
     {
-        // 前台进程的子进程（用户当前活动的整棵树）即使挤占也不降（会话⑳b 定案）
+        // 前台进程的子进程（IDE 的 rg/编译等）：按标准档降级（50% / 30s）——
+        // 降子进程不影响前台响应度，代价仅是变慢（会话⑳c 定案，修正"树内绝不降"过度保护）
         var input = Input(95, foregroundPid: 100,
-            (100, "editor.exe", 5), (200, "browser-render.exe", 95)) with
-        {
-            ForegroundTreePids = new HashSet<int> { 100, 200 },   // 200 是前台 100 的子进程
-        };
+            (100, "editor.exe", 5), (200, "rg.exe", 95));
 
-        var proposals = PolicyEngine.Evaluate(input, DefaultConfig);
-
-        Assert.Empty(proposals);
+        var proposal = Assert.Single(PolicyEngine.Evaluate(input, DefaultConfig));
+        Assert.Equal(200, proposal.TargetPid);
+        Assert.Equal(30_000, proposal.DurationMs);   // 标准时长（非温和 10s、非不降）
+        Assert.DoesNotContain("近期前台", proposal.Reason);
     }
 
     [Fact]

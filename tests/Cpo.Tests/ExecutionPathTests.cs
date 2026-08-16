@@ -43,8 +43,6 @@ public class ExecutionPathTests
             Processes[pid] = s with { AffinityMask = mask };
             return new InterventionResult(true, null);
         }
-
-        public IReadOnlySet<int> GetDescendantPids(int rootPid) => new HashSet<int> { rootPid };
     }
 
     private static PolicyProposal Proposal(int pid, string name, ProposalActionKind action,

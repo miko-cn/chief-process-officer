@@ -184,21 +184,22 @@ public class PolicyRunnerTests
     }
 
     [Fact]
-    public async Task Evaluate_Heuristic_SkipsForegroundProcessTree()
+    public async Task Evaluate_Heuristic_DowngradesForegroundChildProcess()
     {
+        // 前台进程的子进程（IDE 的工具进程等）按标准档降级（会话⑳c）：
+        // 子进程降级只影响它自己，不影响前台进程的响应度
         var store = new FakeTelemetryStore();
         SeedStormSample(store);
         var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
-        // 前台 999 的进程树包含 42（用户正在用的程序的子进程）→ 绝不干预
-        controller.ProcessTrees[999] = new HashSet<int> { 999, 42 };
         var runner = CreateHeuristicRunner(store, controller);
-        runner.ForegroundPid = 999;
+        runner.ForegroundPid = 999;    // 42 是前台 999 的子进程（父子关系不参与判定）
         await using (runner)
         {
             await runner.EvaluateAsync();
 
-            Assert.Empty(controller.Calls);
-            Assert.DoesNotContain(store.Events, e => e.Type == TelemetryEventTypes.PolicyAction);
+            Assert.Contains(controller.Calls, c => c == "prio:42=16384");
+            var decision = store.Events.OfType<PolicyDecisionEvent>().Single();
+            Assert.Contains("heuristic.saturation", decision.Trigger);
         }
     }
 

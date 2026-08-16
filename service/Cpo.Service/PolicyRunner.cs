@@ -14,8 +14,12 @@ namespace Cpo.Service;
 /// </summary>
 public sealed class PolicyRunner : IAsyncDisposable
 {
-    /// <summary>评估输入回看窗口：覆盖采样/落库滞后（进程枚举耗时数百 ms，取 3 倍采样间隔）。</summary>
-    private const long LookbackMs = 5_000;
+    /// <summary>
+    /// 评估输入回看窗口：覆盖采样/落库滞后（进程枚举耗时数百 ms，取 3 倍采样间隔）。
+    /// 2026-08-16 会话⑳c 放宽至 15s：系统饱和时调度饥饿使实际采样间隔远超配置（实测 10s+），
+    /// 5s 窗口会让风暴进程完全缺席输入（实机只看见常驻旧进程）。
+    /// </summary>
+    private const long LookbackMs = 15_000;
 
     private readonly ITelemetryStore _store;
     private readonly IProcessController _controller;
@@ -120,12 +124,8 @@ public sealed class PolicyRunner : IAsyncDisposable
 
         var foregroundPid = ForegroundPid;
 
-        // 前台进程树：用户当前活动的整棵树（含子进程）绝不干预（Toolhelp32 枚举，失败=空集合）
-        var foregroundTree = foregroundPid is int fg
-            ? _controller.GetDescendantPids(fg)
-            : null;
-
-        // 近期前台历史：窗口内曾为前台的进程 → 启发式温和降级（更高阈值 + 更短时长）
+        // 近期前台历史：窗口内曾为前台的进程 → 启发式温和降级（更高阈值 + 更短时长）。
+        // 只记前台进程本身（ReportForeground 上报的 pid），其子进程不算"高频程序"（会话⑳c）。
         var recentWindow = Heuristic.RecentForegroundWindowMs;
         var recentForeground = new HashSet<int>();
         foreach (var (pid, ts) in _recentForegroundMs)
@@ -145,7 +145,6 @@ public sealed class PolicyRunner : IAsyncDisposable
             Processes = latestByPid.Values.ToArray(),
             SystemCpuPercent = systemCpu,
             ForegroundPid = foregroundPid, // GUI 侧上报（SPEC §6）；无前台信息时启发式保守
-            ForegroundTreePids = foregroundTree,
             RecentForegroundPids = recentForeground.Count > 0 ? recentForeground : null,
             Rules = _rules.Rules,
             CoreCount = _coreCount,

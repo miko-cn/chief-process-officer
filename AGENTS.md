@@ -68,11 +68,12 @@ cd app/Cpo.App && winapp run . --detach
 | WinUI 小列表增量更新 | 行数有限（如 20~200）的日志列表：ItemsPanel 用非虚拟化 `StackPanel`，避免顶部插入时容器回收导致视口行闪烁；数据源排序必须确定性（见上一条） |
 | SQLite 内存库 | 测试用 `file:xxx?mode=memory&cache=shared`（`:memory:` 每连接独立）；**DisposeAsync 的 ClearAllPools 是全局的**——并行测试类要加 `[Collection("NonParallelGrpc")]` 串行 |
 | P/Invoke | 用 `DllImport`（非 LibraryImport），宽字符 API 必须 `CharSet.Unicode` |
-| 策略输入 | 固定滑动窗口（5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
+| 策略输入 | 固定滑动窗口（15s，会话⑳c 放宽——饱和时采样滞后实测超 5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
 | 干预防抖 | 恢复后 DurationMs 内冷却（`_lastRestoredMs`），恢复时刻由调用方传入 |
 | ProBalance 开关 | 执行干预 ⇔ `Mode==Automatic && InterventionEnabled`（volatile 字段）；关闭 = 立即 RestoreAll 并留痕；切换事件 `policy.intervention_toggled`（schema §8）；App ToggleSwitch TwoWay 绑定必须配同步标志（`SyncInterventionEnabled`）防程序刷新误触发 gRPC |
-| 启发式（响应性保护） | 目标 = OS/前台响应性，降 CPU 是手段不是指标（会话⑲）；触发三条件齐备：系统饱和（≥90%）+ 进程挤占（≥50%）+ 非关键（非前台/非系统关键名单，**含引擎自身 cpo.service/cpo.app**）；无前台信息 = 整体保守跳过；规则永远优先。**三档保护**（⑳b）：前台进程树（Toolhelp32 枚举）绝不干预 / 近期前台（1h）温和降级（80% + 10s）/ 普通 50% + 30s；**条件解除提前恢复**（启发式干预 CPU 已低 → 立即恢复，规则干预除外） |
+| 启发式（响应性保护） | 目标 = OS/前台响应性，降 CPU 是手段不是指标（会话⑲）；触发三条件齐备：系统饱和（≥90%）+ 进程挤占（≥50%）+ 非关键（非前台/非系统关键名单，**含引擎自身 cpo.service/cpo.app**）；无前台信息 = 整体保守跳过；规则永远优先。**两档保护**（⑳c）：前台进程本身绝不降 / 近期前台（1h，仅前台本身 pid）温和降（80% + 10s）/ **其余含前台子进程**（rg/编译等，降了不影响前台响应）标准降 50% + 30s；**条件解除提前恢复**（启发式干预 CPU 已低 → 立即恢复，规则干预除外） |
 | service 异常防护 | **所有采样/评估/清理循环必须 try/catch**（实机教训：TelemetryRecorder 曾因一次 SQLite disk I/O error 未处理异常裸崩，遥测停摆；EvaluateLoop/PurgeLoop/Gatekeeper 都有，唯独 recorder 漏了）；Program.Main 全局兜底 catch 走正常收尾 |
+| 采样饱和失效 | 系统 100% 饱和时采样器饿死：风暴进程样本 CPU=0/缺失，启发式只见常驻旧样本（会话⑳c 实证）——**已知遗留**，修法候选：采样线程提优先级 / ETW / PDH |
 | gRPC named pipes | 契约在 `contracts/Cpo.Contracts`；服务端 `UseNamedPipes(o => o.CurrentUserOnly=true)` + `ListenNamedPipe("cpo-telemetry-<user>")`；客户端 `GrpcChannel.ForAddress` + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream（无 TransportType 选项）；**gRPC 是传输层，事件信封 payload_json 复用 schema JSON** |
 | proto 定义顺序 | **service 引用的 message 必须先定义**（Grpc.Tools 2.67 实测：message 在 service 之后报 "not defined"，前向引用不被接受）；注意 RPC 名与 message 名前缀相反易写反（`ReportForeground` vs `ForegroundReportResponse`） |
 | gRPC 安全 | 默认 ACL 允许同用户任意进程连接！必须 `CurrentUserOnly=true`（防其他用户）+ `AuthInterceptor` 会话令牌校验（防同用户任意进程）；**会话令牌来自门卫管道 `cpo-gate-<user>`**（握手时 `GetNamedPipeClientProcessId` 校验对端必须是 Cpo.App.exe → 发放 256-bit 内存令牌，12h 不落盘；文件令牌已废弃）；客户端先握手再调用，`Unauthenticated` 时清令牌自动重握手 |

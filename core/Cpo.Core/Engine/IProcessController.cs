@@ -25,11 +25,4 @@ public interface IProcessController
 
     /// <summary>设置进程 CPU 亲和性掩码。</summary>
     InterventionResult SetAffinityMask(int pid, ulong mask);
-
-    /// <summary>
-    /// 返回以 rootPid 为根的进程树（含 rootPid 自身与全部后代 pid）。
-    /// 启发式"前台进程树保护"用：用户当前活动的进程树绝不干预。
-    /// 进程不存在/枚举失败返回空集合。
-    /// </summary>
-    IReadOnlySet<int> GetDescendantPids(int rootPid);
 }

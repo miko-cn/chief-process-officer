@@ -103,8 +103,9 @@ public static partial class ProcessController
 
     /// <summary>
     /// 进程树枚举（Toolhelp32 快照）：返回 rootPid 自身与全部后代 pid。
-    /// 启发式"前台进程树保护"的数据源（用户当前活动的整个进程树绝不干预）。
-    /// 失败/进程不存在返回空集合（保守：空集合 = 不保护额外进程，不误伤保护能力）。
+    /// 启发式不使用（会话⑳c 定案：子进程按标准档降级，不影响前台响应）；
+    /// 保留供 M3 进程表 UI 的"按进程树分组"视图使用。
+    /// 失败/进程不存在返回空集合。
     /// </summary>
     public static IReadOnlySet<int> GetDescendantPids(int rootPid)
     {
@@ -182,8 +183,6 @@ public static partial class ProcessController
 
         public InterventionResult SetAffinityMask(int pid, ulong mask) =>
             ProcessController.SetAffinityMask(pid, mask);
-
-        public IReadOnlySet<int> GetDescendantPids(int rootPid) => ProcessController.GetDescendantPids(rootPid);
     }
 
     private static Microsoft.Win32.SafeHandles.SafeProcessHandle OpenProcess(int pid, ProcessAccessFlags access)

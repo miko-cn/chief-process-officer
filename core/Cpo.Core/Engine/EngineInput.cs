@@ -25,14 +25,10 @@ public sealed record EngineInput
     public int? ForegroundPid { get; init; }
 
     /// <summary>
-    /// 前台进程树（含前台进程自身与全部后代 pid，service 侧枚举传入）。
-    /// 用户当前直接活动的整个进程树：启发式绝不干预（会话⑲+⑳b 定案）。
-    /// </summary>
-    public IReadOnlySet<int>? ForegroundTreePids { get; init; }
-
-    /// <summary>
     /// 近期（启发式窗口内）曾为前台的进程 pid 集合（service 内存维护）。
     /// 这些程序是用户高频使用的：启发式只做"温和降级"（更高触发阈值 + 更短时长）。
+    /// 注意：前台进程的子进程**不在此列**（也不受任何特殊保护）——降子进程不影响前台
+    /// 响应度（会话⑳c 定案），按标准档处理。
     /// </summary>
     public IReadOnlySet<int>? RecentForegroundPids { get; init; }
 

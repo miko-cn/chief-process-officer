@@ -58,12 +58,9 @@ public static class PolicyEngine
                 continue;
             }
 
-            // 前台进程树（用户当前直接活动的整棵树）：绝不干预
-            if (input.ForegroundTreePids?.Contains(process.Pid) == true)
-            {
-                continue;
-            }
-
+            // 前台进程树子进程（IDE 的 rg/编译、AI agent 工具等）：按标准档降级——
+            // 降子进程只影响它自己（调度器仍优先给 Normal 的前台进程），代价仅是变慢，
+            // 不影响前台响应度（会话⑳c 定案，修正"树内绝不降"的过度保护）。
             // 近期前台程序（用户高频使用）：温和降级（更高阈值 + 更短时长）
             var recentForeground = input.RecentForegroundPids?.Contains(process.Pid) == true;
             if (IsHeuristicTarget(process, heuristic!, recentForeground))
