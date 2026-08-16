@@ -122,6 +122,46 @@ public class SqliteTelemetryStoreTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Query_Descending_TieBreak_IsStableByInsertionOrder()
+    {
+        // 同一毫秒多条事件（一轮决策+动作常同 ms 落库）：次级键 id（插入序）保证顺序稳定，
+        // 否则轮询间顺序翻转会让 app 增量合并把视口内行删掉重插（表现为行闪烁消失）
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new ProcessLifecycleEvent(100, LifecycleKind.Started, 1, 0, "first", null),
+            new ProcessLifecycleEvent(100, LifecycleKind.Started, 2, 0, "second", null),
+            new ProcessLifecycleEvent(100, LifecycleKind.Started, 3, 0, "third", null),
+        });
+
+        var result = await ToListAsync(Store.QueryAsync(new EventQuery
+        {
+            Table = TelemetryTable.EventLog,
+            Descending = true,
+        }));
+
+        // id DESC = 插入序倒序
+        Assert.Equal(new[] { "third", "second", "first" },
+            result.Select(e => ((ProcessLifecycleEvent)e).Name));
+    }
+
+    [Fact]
+    public async Task Query_Union_TieBreak_IsDeterministic()
+    {
+        // 跨表 UNION 用 type 破平（类型按表路由，同 ts 同 type 不可能跨表 → 全序确定）
+        await Store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new ProcessLifecycleEvent(100, LifecycleKind.Started, 1, 0, "p", null),
+            new CpuSampleEvent(100, SampleScope.System, null, null, 1, 1, 8, 1000),
+        });
+
+        var result = await ToListAsync(Store.QueryAsync(new EventQuery { Descending = true }));
+
+        // type DESC："sample.cpu" > "process.lifecycle"
+        Assert.Equal(new[] { TelemetryEventTypes.CpuSample, TelemetryEventTypes.ProcessLifecycle },
+            result.Select(e => e.Type));
+    }
+
+    [Fact]
     public async Task Query_Descending_WithTypeFilter()
     {
         await Store.AppendBatchAsync(new TelemetryEvent[]

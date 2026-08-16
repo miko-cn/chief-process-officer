@@ -64,7 +64,8 @@ cd app/Cpo.App && winapp run . --detach
 | 事件序列化 | payload = camelCase 业务字段（无 type），type 独立列；用 `TelemetryEventSerializer`，禁用 STJ 多态判别符 |
 | 枚举 JSON | 必须 `JsonStringEnumConverter(CamelCase)`（RuleStore 等） |
 | SQLite 双表 | `samples`（热，1h）+ `event_log`（冷，30d）分层；路由用 `TelemetryTableRouter`；清理循环在 service PurgeLoopAsync |
-| SQLite 查询 | 取最近 N 条用 `Descending=true`；前缀用 `TypePrefix`；进程过滤用 `json_extract(payload,'$.pid')`；UNION 查询外层包装再 ORDER BY ts_ms |
+| SQLite 查询 | 取最近 N 条用 `Descending=true`；前缀用 `TypePrefix`；进程过滤用 `json_extract(payload,'$.pid')`；UNION 查询外层包装再 ORDER BY ts_ms；**排序必须带次级键破平**（同 ts_ms 事件：单表 `id` / 跨表 UNION `type`），否则轮询间顺序翻转 → 增量合并把行删掉重插（列表闪烁） |
+| WinUI 小列表增量更新 | 行数有限（如 20~200）的日志列表：ItemsPanel 用非虚拟化 `StackPanel`，避免顶部插入时容器回收导致视口行闪烁；数据源排序必须确定性（见上一条） |
 | SQLite 内存库 | 测试用 `file:xxx?mode=memory&cache=shared`（`:memory:` 每连接独立）；**DisposeAsync 的 ClearAllPools 是全局的**——并行测试类要加 `[Collection("NonParallelGrpc")]` 串行 |
 | P/Invoke | 用 `DllImport`（非 LibraryImport），宽字符 API 必须 `CharSet.Unicode` |
 | 策略输入 | 固定滑动窗口（5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |

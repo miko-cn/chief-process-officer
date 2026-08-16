@@ -555,3 +555,19 @@ on:
 ### 15.4 验收
 - ✅ 95/95 测试全绿（本轮为 app/core 注释/工具文件改动，无测试影响面）
 - ✅ 实机：压力进程被降优（decision+action 落库）→ app 增量更新无闪烁；service 重启 app 自动重连
+
+## 2026-08-15 会话 ⑯ — 增量更新残留问题：视口内行"消失"（排序确定性 + 虚拟化）
+
+**背景**：用户反馈不闪了，但刷新时视口内部分行短暂消失——置顶时下半视口消失、滚到底时上半视口消失。
+
+### 16.1 根因（两层，都修了）
+
+1. **排序非确定性（主因）**：`ORDER BY ts_ms DESC` 无次级键。一轮策略评估的 decision+action 常**同一毫秒**落库（同 ts 多条），`LIMIT 20` 的 top-N 排序随数据插入变化 → 同 ts 事件顺序在轮询间**翻转** → 增量合并把视口内行删掉重插（表现为消失/重现，位置随机）
+   - 修复（`SqliteTelemetryStore.BuildSelect`）：单表排序加次级键 `id`（自增=插入序）；跨表 UNION 用 `type` 破平（类型按表路由，同 ts 同 type 不可能跨表 → 全序确定）
+   - 新测试 2 个：`Query_Descending_TieBreak_IsStableByInsertionOrder` / `Query_Union_TieBreak_IsDeterministic`
+2. **虚拟化容器回收**：ListView 默认 ItemsStackPanel 虚拟化，顶部插入时容器回收/重排可能造成短暂空白
+   - 修复（`MainPage.xaml`）：上限 20 行 → ItemsPanel 换非虚拟化 `StackPanel`，容器常驻，插入只做布局平移
+
+### 16.2 验收
+- ✅ 97/97 测试全绿（+2 新测试）
+- ✅ 实机部署：app（PID 16120）自动重连、轮询正常；等用户确认视口不再消失（压力进程已按用户要求停掉，可随时重启演示）

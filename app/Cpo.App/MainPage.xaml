@@ -47,13 +47,18 @@
             </StackPanel>
         </Border>
 
-        <!-- 操作日志列表（最新在最上面） -->
+        <!-- 操作日志列表（最新在最上面；上限 20 行 → 用非虚拟化 StackPanel，避免增量插入时容器回收导致行闪烁） -->
         <ListView
             Grid.Row="2"
             x:Name="EventsList"
             ItemsSource="{x:Bind ViewModel.Events, Mode=OneWay}"
             AutomationProperties.AutomationId="EventsList"
             AutomationProperties.Name="操作日志">
+            <ListView.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <StackPanel />
+                </ItemsPanelTemplate>
+            </ListView.ItemsPanel>
             <ListView.ItemTemplate>
                 <DataTemplate x:DataType="vm:EventRow">
                     <Grid ColumnSpacing="12" Padding="0,4">

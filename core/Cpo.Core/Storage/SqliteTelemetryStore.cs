@@ -226,30 +226,34 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
         }
 
         var where = clauses.Count > 0 ? " WHERE " + string.Join(" AND ", clauses) : "";
-        var order = query.Descending ? " ORDER BY ts_ms DESC" : " ORDER BY ts_ms ASC";
+        // 排序必须带次级键保证确定性：同 ts_ms 的事件（一轮决策+动作常同一毫秒落库）若顺序在轮询间翻转，
+        // app 增量合并会把视口内行删掉重插（表现为行闪烁消失）。单表用 id（自增=插入序）破平；
+        // 跨表 UNION 用 type 破平（事件类型按表路由，同 ts 同 type 不可能跨表，故全序确定）。
+        var orderSingle = query.Descending ? " ORDER BY ts_ms DESC, id DESC" : " ORDER BY ts_ms ASC, id ASC";
+        var orderUnion = query.Descending ? " ORDER BY ts_ms DESC, type DESC" : " ORDER BY ts_ms ASC, type ASC";
         var limit = query.Limit is int l ? $" LIMIT {l}" : "";
 
         // 表选择：显式指定 > 按类型推导 > 跨表 UNION
         string sql;
         if (query.Table is TelemetryTable explicitTable)
         {
-            sql = $"SELECT type, payload FROM {TelemetryTableRouter.TableName(explicitTable)}{where}{order}{limit}";
+            sql = $"SELECT type, payload FROM {TelemetryTableRouter.TableName(explicitTable)}{where}{orderSingle}{limit}";
         }
         else
         {
             var inferred = InferTable(query);
             if (inferred is TelemetryTable t)
             {
-                sql = $"SELECT type, payload FROM {TelemetryTableRouter.TableName(t)}{where}{order}{limit}";
+                sql = $"SELECT type, payload FROM {TelemetryTableRouter.TableName(t)}{where}{orderSingle}{limit}";
             }
             else
             {
-                // UNION ALL：每支子查询带相同过滤与排序，外层再统一排序
-                // （UNION 结果集无 ts_ms 列，不能直接 ORDER BY ts_ms）
+                // UNION ALL：每支子查询带相同过滤，外层统一排序
+                // （UNION 结果集无 ts_ms 列，不能直接 ORDER BY ts_ms，且需 type 破平保证确定性）
                 var branch = $"SELECT type, payload, ts_ms FROM {{0}}{where}";
                 sql = $"SELECT type, payload FROM ({string.Format(branch, TelemetryTableRouter.SamplesTableName)} " +
                       $"UNION ALL " +
-                      $"{string.Format(branch, TelemetryTableRouter.EventLogTableName)}){order}{limit}";
+                      $"{string.Format(branch, TelemetryTableRouter.EventLogTableName)}){orderUnion}{limit}";
             }
         }
 
