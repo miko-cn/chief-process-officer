@@ -6,6 +6,7 @@ using Cpo.Core.Telemetry;
 using Cpo.Interop;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.NamedPipes;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Cpo.Service;
@@ -75,19 +76,29 @@ internal static class Program
         };
 
         // gRPC over named pipes（本地 IPC，GUI↔服务通信）
+        // 安全加固（2026-08-15）：
+        //   1) CurrentUserOnly=true —— 管道 ACL 只允许当前用户连接（防其他用户/服务）
+        //   2) 连接令牌校验 —— gRPC metadata 携带共享令牌，拦截器校验（防同用户任意进程直接调用）
         var pipeName = $"cpo-telemetry-{Environment.UserName}";
+        var authToken = AuthTokenManager.LoadOrCreate();
         var grpcBuilder = WebApplication.CreateSlimBuilder(new WebApplicationOptions());
-        grpcBuilder.Services.AddSingleton<ITelemetryStore>(store);
-        grpcBuilder.Services.AddSingleton<Func<DecisionMode>>(() => runner.Mode);
-        grpcBuilder.Services.AddSingleton<TelemetryGrpcService>();
-        grpcBuilder.Services.AddGrpc();
+        grpcBuilder.WebHost.UseNamedPipes(o => o.CurrentUserOnly = true);
         grpcBuilder.WebHost.ConfigureKestrel(k =>
             k.ListenNamedPipe(pipeName, listenOptions => listenOptions.Protocols =
                 Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2));
+        grpcBuilder.Services.AddSingleton<ITelemetryStore>(store);
+        grpcBuilder.Services.AddSingleton<Func<DecisionMode>>(() => runner.Mode);
+        grpcBuilder.Services.AddSingleton<TelemetryGrpcService>();
+        grpcBuilder.Services.AddGrpc(o =>
+        {
+            // 所有 RPC 方法统一走令牌校验拦截器
+            o.Interceptors.Add<AuthInterceptor>();
+        });
+        grpcBuilder.Services.AddSingleton(new AuthOptions(authToken));
         var grpcServer = grpcBuilder.Build();
         grpcServer.MapGrpcService<TelemetryGrpcService>();
         await grpcServer.StartAsync(cts.Token);
-        Console.WriteLine($"  gRPC: \\\\.\\pipe\\{pipeName}");
+        Console.WriteLine($"  gRPC: \\\\.\\pipe\\{pipeName}（仅当前用户 + 令牌校验）");
 
         try
         {

@@ -3,6 +3,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Cpo.Contracts.Telemetry;
 using Cpo.Core.Telemetry;
+using Grpc.Core;
 using Grpc.Net.Client;
 
 namespace Cpo.App.ViewModels;
@@ -101,12 +102,43 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
         {
             HttpHandler = handler,
         });
-        return new TelemetryService.TelemetryServiceClient(channel);
+        var client = new TelemetryService.TelemetryServiceClient(channel);
+        _ = client; // 每次调用通过 CallOptions 携带令牌（见下方 WithAuth）
+        return client;
+    }
+
+    /// <summary>携带连接令牌的调用选项（与 service 端 AuthInterceptor 对应）。</summary>
+    private static CallOptions WithAuth(CancellationToken ct = default)
+    {
+        var headers = new Metadata();
+        var token = ReadToken();
+        if (token is not null)
+        {
+            headers.Add("cpo-auth-token", token);
+        }
+
+        return new CallOptions(headers, cancellationToken: ct);
+    }
+
+    private static string? ReadToken()
+    {
+        try
+        {
+            // service 生成的令牌文件：%PROGRAMDATA%\Cpo\auth-token（打包 app 可读——文件 ACL 含当前用户）
+            var path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "Cpo", "auth-token");
+            return File.Exists(path) ? File.ReadAllText(path).Trim() : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task RefreshStatusAsync()
     {
-        var status = await _client!.GetStatusAsync(new GetStatusRequest());
+        var status = await _client!.GetStatusAsync(new GetStatusRequest(), WithAuth());
         ServiceInfo = $"引擎: {status.EngineMode} | samples: {status.SamplesCount:N0} | 日志: {status.EventLogCount:N0}";
     }
 
@@ -118,7 +150,7 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
             TypePrefix = "policy.",   // 操作日志面板：只看决策/动作/规则变更
             Descending = true,
             Limit = 20,
-        });
+        }, WithAuth());
 
         // 新事件（ts > 上次看到的最新 ts）插到顶部
         var newest = response.Events.FirstOrDefault();

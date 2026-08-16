@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\..\core\Cpo.Core\Cpo.Core.csproj" />
@@ -8,6 +8,9 @@
 
   <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" Version="2.83.0" />
+    <!-- FileSecurity/ACL（Windows 专用访问控制） -->
+    <PackageReference Include="System.IO.FileSystem.AccessControl" Version="5.0.0" />
+    <PackageReference Include="System.Security.AccessControl" Version="6.0.1" />
   </ItemGroup>
 
   <PropertyGroup>

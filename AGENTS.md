@@ -69,8 +69,10 @@ cd app/Cpo.App && winapp run . --detach
 | P/Invoke | 用 `DllImport`（非 LibraryImport），宽字符 API 必须 `CharSet.Unicode` |
 | 策略输入 | 固定滑动窗口（5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
 | 干预防抖 | 恢复后 DurationMs 内冷却（`_lastRestoredMs`），恢复时刻由调用方传入 |
-| gRPC named pipes | 契约在 `contracts/Cpo.Contracts`；服务端 `ListenNamedPipe("cpo-telemetry-<user>")`；客户端 `GrpcChannel.ForAddress` + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream（无 TransportType 选项）；**gRPC 是传输层，事件信封 payload_json 复用 schema JSON** |
+| gRPC named pipes | 契约在 `contracts/Cpo.Contracts`；服务端 `UseNamedPipes(o => o.CurrentUserOnly=true)` + `ListenNamedPipe("cpo-telemetry-<user>")`；客户端 `GrpcChannel.ForAddress` + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream（无 TransportType 选项）；**gRPC 是传输层，事件信封 payload_json 复用 schema JSON** |
+| gRPC 安全 | 默认 ACL 允许同用户任意进程连接！必须 `CurrentUserOnly=true`（防其他用户）+ `AuthInterceptor` 令牌校验（防同用户任意进程，令牌在 %PROGRAMDATA%\Cpo\auth-token，service 生成 app 读取）；客户端每次调用带 metadata `cpo-auth-token` |
 | gRPC 服务类命名 | proto 生成的静态类 `TelemetryService` 占用类名 → 实现类用 `TelemetryGrpcService` |
+| FileSecurity | 在 `System.IO.FileSystem.AccessControl` 包，命名空间 `System.Security.AccessControl`；用 `FileInfo.SetAccessControl` 而非 `File.SetAccessControl` |
 | WebApplication | 必须 `builder.Services.AddXxx` 后 `builder.Build()`；Services 属性只读 |
 | 打包 app 数据 | LocalAppData 被虚拟化到 `%LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local`——M3 起 app 走 gRPC 不再直读文件 |
 

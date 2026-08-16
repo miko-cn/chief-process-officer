@@ -2,6 +2,7 @@ using Cpo.Contracts.Telemetry;
 using Cpo.Core.Storage;
 using Cpo.Core.Telemetry;
 using Cpo.Service;
+using Grpc.Core;
 using Grpc.Net.Client;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -18,6 +19,7 @@ namespace Cpo.Tests;
 public class GrpcNamedPipeTests : IAsyncLifetime
 {
     private const string PipeName = "cpo-test-pipe";
+    private const string TestToken = "test-token-0123456789abcdef";
     private SqliteTelemetryStore _store = null!;
     private WebApplication _server = null!;
 
@@ -30,7 +32,9 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         builder.Services.AddSingleton<ITelemetryStore>(_store);
         builder.Services.AddSingleton<Func<DecisionMode>>(() => DecisionMode.Automatic);
         builder.Services.AddSingleton<TelemetryGrpcService>();
-        builder.Services.AddGrpc();
+        builder.Services.AddSingleton(new AuthOptions(TestToken));
+        builder.Services.AddGrpc(o => o.Interceptors.Add<AuthInterceptor>());
+        builder.WebHost.UseNamedPipes(o => o.CurrentUserOnly = true);
         builder.WebHost.ConfigureKestrel(k =>
             k.ListenNamedPipe(PipeName, listenOptions => listenOptions.Protocols =
                 Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2));
@@ -47,7 +51,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         // 影响并行测试类的共享内存库）。内存库随进程结束回收。
     }
 
-    private TelemetryService.TelemetryServiceClient CreateClient()
+    private TelemetryService.TelemetryServiceClient CreateClient(string? token = TestToken)
     {
         // gRPC over named pipes 官方客户端模式（.NET 8）：
         // GrpcChannel.ForAddress + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream
@@ -70,6 +74,38 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         return new TelemetryService.TelemetryServiceClient(channel);
     }
 
+    private static CallOptions AuthCall(string? token = TestToken)
+    {
+        var headers = new Metadata();
+        if (token is not null)
+        {
+            headers.Add(AuthConstants.TokenHeaderKey, token);
+        }
+
+        return new CallOptions(headers);
+    }
+
+    [Fact]
+    public async Task Unauthenticated_Call_IsRejected()
+    {
+        await _store.AppendBatchAsync(new TelemetryEvent[]
+        {
+            new PolicyDecisionEvent(200, "cpu.storm", 42, "msbuild.exe", "[]", "{}", DecisionMode.Automatic, "{}"),
+        });
+
+        var client = CreateClient();
+
+        // 无令牌 → Unauthenticated
+        var ex = await Assert.ThrowsAsync<Grpc.Core.RpcException>(async () =>
+            await client.GetStatusAsync(new GetStatusRequest(), AuthCall(token: null)));
+        Assert.Equal(Grpc.Core.StatusCode.Unauthenticated, ex.StatusCode);
+
+        // 错误令牌 → Unauthenticated
+        var ex2 = await Assert.ThrowsAsync<Grpc.Core.RpcException>(async () =>
+            await client.QueryEventsAsync(new QueryEventsRequest(), AuthCall("wrong-token")));
+        Assert.Equal(Grpc.Core.StatusCode.Unauthenticated, ex2.StatusCode);
+    }
+
     [Fact]
     public async Task QueryEvents_RoundTripsEvents()
     {
@@ -83,7 +119,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         var response = await client.QueryEventsAsync(new QueryEventsRequest
         {
             TypePrefix = "policy.",
-        });
+        }, AuthCall());
 
         var envelope = Assert.Single(response.Events);
         Assert.Equal(TelemetryEventTypes.PolicyDecision, envelope.Type);
@@ -101,7 +137,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         });
 
         var client = CreateClient();
-        var status = await client.GetStatusAsync(new GetStatusRequest());
+        var status = await client.GetStatusAsync(new GetStatusRequest(), AuthCall());
 
         Assert.Equal("automatic", status.EngineMode);
         Assert.Equal(1, status.SamplesCount);
@@ -124,7 +160,7 @@ public class GrpcNamedPipeTests : IAsyncLifetime
             TypePrefix = "policy.",
             Descending = true,
             Limit = 2,
-        });
+        }, AuthCall());
 
         Assert.Equal(2, response.Events.Count);
         Assert.Equal(300, response.Events[0].TsMs);

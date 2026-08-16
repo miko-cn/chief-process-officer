@@ -472,10 +472,21 @@ on:
 
 ### 13.5 验收结果
 
-- ✅ 94/94 单测全绿（新增：双表路由/前缀查询/显式表/分级清理/gRPC 管道 3 项集成）
+- ✅ 95/95 单测全绿（新增：双表路由/前缀查询/显式表/分级清理/gRPC 管道 4 项集成 + 认证拒绝）
 - ✅ 实机端到端：service（gRPC 管道）→ 压力进程降优 → app 显示「已连接 · 最近 20 条操作记录（每 2s 自动刷新）」+ 干预记录实时出现
 - ✅ 双表计数验证：samples 30006 / event_log 464（数据分层生效）
 - ✅ 库大小问题根治（清理循环接入 + 采样回 2s + 分层保留）
+
+### 13.5b gRPC 安全加固（用户追问"任意进程都能访问吗"后实施）
+
+**问题**：`ListenNamedPipe` 默认 ACL 允许**同用户任意进程**连接（其他用户被拒），无身份校验。
+
+**加固（两层，已实机验证）**：
+1. **管道 ACL**：`WebHost.UseNamedPipes(o => o.CurrentUserOnly = true)`——Kestrel 自动把管道 ACL 限制为当前用户（防其他用户/服务）
+2. **连接令牌**：service 启动时生成 256-bit 随机令牌写 `%PROGRAMDATA%\Cpo\auth-token`（ACL 限 SYSTEM+当前用户）；gRPC 所有 RPC 经 `AuthInterceptor` 校验 metadata `cpo-auth-token`（恒定时间比较防时序侧信道）；app 读同一文件携带令牌
+- 实测：无令牌/错误令牌 → `Unauthenticated` 被拒；正确令牌 → 正常
+- **威胁模型说明**：令牌文件同用户可读（app 需要），防的是"同用户任意进程直接调用"；同用户恶意进程仍可读令牌文件——真正强校验（对端 PID 验证）需要自定义传输层，M3 评估，当前基线对齐 Process Lasso 级别
+- 坑：`FileSecurity` 在 `System.IO.FileSystem.AccessControl` 包，命名空间 `System.Security.AccessControl`；`File.SetAccessControl` 用 `FileInfo.SetAccessControl` 替代（2 参重载解析问题）
 
 ### 13.6 下一步（M3 续）
 - [ ] ProBalance 开关（app → service 控制面，gRPC SetInterventionEnabled，运行时切换引擎态）
