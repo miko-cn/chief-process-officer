@@ -69,6 +69,7 @@ cd app/Cpo.App && winapp run . --detach
 | WinUI 小列表增量更新 | 行数有限（如 20~200）的日志列表：ItemsPanel 用非虚拟化 `StackPanel`，避免顶部插入时容器回收导致视口行闪烁；数据源排序必须确定性（见上一条） |
 | SQLite 内存库 | 测试用 `file:xxx?mode=memory&cache=shared`（`:memory:` 每连接独立）；**DisposeAsync 的 ClearAllPools 是全局的**——并行测试类要加 `[Collection("NonParallelGrpc")]` 串行 |
 | P/Invoke | 用 `DllImport`（非 LibraryImport），宽字符 API 必须 `CharSet.Unicode` |
+| GetSystemTimes | **kernel 含 idle**——系统 CPU 累计必须 `kernel+user−idle`，否则系统 CPU% 恒≈100%（启发式"饱和≥90%"恒真 → 非饱和期持续误降常驻挤占者如 chrome，会话⑳f 实机教训）；进程级 GetProcessTimes 无此问题 |
 | 策略输入 | 固定滑动窗口（15s，会话⑳c 放宽——饱和时采样滞后实测超 5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
 | 干预防抖 | 恢复后 DurationMs 内冷却（`_lastRestoredMs`），恢复时刻由调用方传入 |
 | ProBalance 开关 | 执行干预 ⇔ `Mode==Automatic && InterventionEnabled`（volatile 字段）；关闭 = 立即 RestoreAll 并留痕；切换事件 `policy.intervention_toggled`（schema §8）；App ToggleSwitch TwoWay 绑定必须配同步标志（`SyncInterventionEnabled`）防程序刷新误触发 gRPC |

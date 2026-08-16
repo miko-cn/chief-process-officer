@@ -56,7 +56,7 @@
 | `pid` | int | — | process 必填 | 进程 ID |
 | `name` | string | — | process 必填 | 进程名 |
 | `cpuPercent` | double | % | ✅ | 该间隔平均占用。进程级 0~100；系统级 0~100（整体占用率，非×核数） |
-| `totalCpuMs` | long | ms | ❌ | 进程累计 CPU 时间（kernel+user），用于百分比计算与校验 |
+| `totalCpuMs` | long | ms | ❌ | 累计 busy CPU 时间，用于百分比计算与校验。进程级 = kernel+user；**系统级 = kernel+user−idle**（GetSystemTimes 的 kernel 含 idle，不扣则恒≈满负载，会话⑳f） |
 | `coreCount` | int | — | system 必填 | 逻辑核心数 |
 | `intervalMs` | long | ms | ✅ | 本次采样间隔（用于百分比还原） |
 

@@ -14,7 +14,7 @@ public sealed record ProcessSnapshot(
 
 /// <summary>系统快照（P/Invoke 采集原始值）。</summary>
 public sealed record SystemSnapshot(
-    long TotalCpuMs,      // 所有核心累计 CPU 时间（毫秒）
+    long TotalCpuMs,      // busy CPU 时间（kernel + user − idle，毫秒；kernel 含 idle 必须扣除，会话⑳f）
     long IdleCpuMs,       // 空闲 CPU 时间（毫秒）
     long AvailableBytes,  // 可用物理内存
     long TotalBytes,      // 总物理内存

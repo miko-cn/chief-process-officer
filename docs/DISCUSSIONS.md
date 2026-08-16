@@ -842,3 +842,34 @@ on:
 - ✅ 实机：service+app 重启，采样/评估/查询正常
 - 待 M3：R4 WatchEvents 内存广播 + 复合游标（(ts_ms, id)）、R9 采样路径减负（随进程表面板实现）
 - 本次为纯性能/健壮性改进，SPEC 无产品语义变化，未改 schema 契约
+
+## 2026-08-17 会话 ⑳f — 系统 CPU 恒 ≈100% bug（GetSystemTimes kernel 含 idle）——"占用不大却频繁降 chrome"根因
+
+**用户观察**：当前机器占用不大，但服务在频繁降 chrome 优先级——为什么？
+
+### 20f.1 诊断（DB 原始数据实锤）
+
+- 查 samples 系统级样本：**cpuPercent 恒 99.6~100%**（空闲时也一样）→ 启发式"系统饱和 ≥90%"**恒真** → `heuristicArmed` 永远 true → chrome 只要占满单核（≥50%）就被降，每 2s 一条 `heuristic.saturation` 决策
+- 用户"占用不大"的直觉是对的——是采样输入错，不是策略错
+
+### 20f.2 根因
+
+`SystemSampler.Snapshot()`：`TotalCpuMs = kernel + user`，而 **`GetSystemTimes` 的 `lpKernelTime` 含 idle 时间**（MSDN 文档化行为）。`CpuUsageCalculator.Compute` 的 `Δ/elapsed/cores` 对"含 idle 的总流逝时间"恒等 1 → 系统 CPU% 恒 ≈100%（16 核空闲 2s：Δ=16×2000ms，`1600×100/2000/16`=100%）。
+
+代码里算了 `idle100ns`（IdleCpuMs 字段）但从未参与计算——**算了没用，正是信号**。
+
+### 20f.3 修复
+
+`SystemSampler`：`total100ns = kernel + user − idle`（busy 时间，与进程级 GetProcessTimes 语义一致）。同步：SystemSnapshot 注释 + schema.md §2 `totalCpuMs` 说明（系统级 = kernel+user−idle）。
+
+### 20f.4 验证
+
+- ✅ 修复后系统样本：**0 / 9.4 / 12.9 / 13.5%**（真实负载，与用户观察一致）
+- ✅ 非饱和期**零决策**（20s 内无 policy.decision，chrome 不再被降）
+- ✅ 130/130 测试全绿（P/Invoke 层改动，实机验证为主）
+- 环境：service（新 PID）+ app（34268）运行中
+
+### 20f.5 启示（排查方法沉淀）
+
+- **"行为怪异"先查 DB 原始值，再怀疑上层**：⑳d 是样本缺失/为 0（采样饿死）→ 数据面；本次是样本恒满（输入语义错）→ 同样是数据面。两层症状相反、根因不同，但排查路径相同：原始数据 vs 用户观察对不上时，问题在采集层
+- **Win32 累计时间类 API 的 idle 陷阱**：GetSystemTimes（kernel 含 idle）要扣；GetProcessTimes（进程）无 idle 概念。今后任何"累计时间"采样都要确认是否含 idle

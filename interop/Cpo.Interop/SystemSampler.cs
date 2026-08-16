@@ -21,8 +21,12 @@ public static partial class SystemSampler
             throw new Win32ExceptionMarshal();
         }
 
-        // GetSystemTimes 返回 FILETIME（100ns 单位）；kernel 含 idle，需扣除
-        var total100ns = ToInt64(kernel) + ToInt64(user);
+        // GetSystemTimes 返回 FILETIME（100ns 单位）；**kernel 含 idle 时间**（MSDN 文档化行为），
+        // 必须扣除，否则 TotalCpuMs 恒等于"所有核流逝的总时间" → CpuUsageCalculator.Compute
+        // 的 Δ/elapsed/cores 恒 ≈100% → 系统 CPU% 恒满（实机教训 会话⑳f：空闲时系统样本也 100%，
+        // 启发式"系统饱和 ≥90%"恒真 → 非饱和期也持续降 chrome）。
+        // 扣除后 TotalCpuMs = busy 时间，与进程级 TotalCpuMs（GetProcessTimes 无 idle）语义一致。
+        var total100ns = ToInt64(kernel) + ToInt64(user) - ToInt64(idle);
         var idle100ns = ToInt64(idle);
         var coreCount = Environment.ProcessorCount;
 
