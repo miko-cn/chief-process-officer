@@ -20,6 +20,7 @@ public sealed record EventRow(string Time, string Type, string Summary);
 public partial class MainPageViewModel : ObservableObject, IDisposable
 {
     private readonly string _pipeName;
+    private readonly Microsoft.UI.Dispatching.DispatcherQueue _uiDispatcher;
     private TelemetryService.TelemetryServiceClient? _client;
     private PeriodicTimer? _timer;
     private CancellationTokenSource? _cts;
@@ -30,6 +31,10 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     {
         // service 端管道名：cpo-telemetry-<用户名>
         _pipeName = pipeName ?? $"cpo-telemetry-{Environment.UserName}";
+        // ViewModel 在 UI 线程构造：捕获 DispatcherQueue，后台轮询结果 marshal 回 UI
+        // （WinUI ObservableCollection 只能在 UI 线程修改）
+        _uiDispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread()
+                        ?? throw new InvalidOperationException("MainPageViewModel 必须在 UI 线程构造");
     }
 
     [ObservableProperty]
@@ -67,7 +72,16 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
             {
                 while (await _timer.WaitForNextTickAsync(_cts.Token))
                 {
-                    await PollAsync();
+                    try
+                    {
+                        await PollAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        // 轮询异常不杀任务：记录后继续下一轮（service 可能瞬时不可用）
+                        _uiDispatcher.TryEnqueue(() =>
+                            StatusText = $"刷新失败: {ex.Message}（重试中…）");
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -142,48 +156,41 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
         ServiceInfo = $"引擎: {status.EngineMode} | samples: {status.SamplesCount:N0} | 日志: {status.EventLogCount:N0}";
     }
 
-    /// <summary>拉取最新事件（倒序，Limit 20），新事件插入顶部。</summary>
+    /// <summary>拉取最新事件（倒序，Limit 20），每轮全量重建列表，最新在最上面。</summary>
     private async Task PollAsync()
     {
         var response = await _client!.QueryEventsAsync(new QueryEventsRequest
         {
             TypePrefix = "policy.",   // 操作日志面板：只看决策/动作/规则变更
-            Descending = true,
+            Descending = true,        // 最新在前
             Limit = 20,
         }, WithAuth());
 
-        // 新事件（ts > 上次看到的最新 ts）插到顶部
-        var newest = response.Events.FirstOrDefault();
-        if (newest is not null)
-        {
-            _lastTsMs = Math.Max(_lastTsMs, newest.TsMs);
-        }
-
-        var inserted = 0;
+        // 响应为倒序（Events[0] = 最新）→ 直接按序重建，列表索引 0 = 最新在最上面。
+        // 全量重建（Limit 20）天然有序、无重复，避免 Insert(0) 造成的逆序 bug。
+        var rows = new List<EventRow>(response.Events.Count);
         foreach (var envelope in response.Events)
         {
-            if (envelope.TsMs <= _lastTsMs - 1 && inserted >= 20)
-            {
-                break;
-            }
-
-            if (Events.Any(e => e.Time == FormatTime(envelope.TsMs) && e.Type == envelope.Type
-                                 && e.Summary == Summarize(envelope)))
-            {
-                continue;
-            }
-
-            Events.Insert(0, ToRow(envelope));
-            inserted++;
+            rows.Add(ToRow(envelope));
         }
 
-        // 截断到 200 条，防止无限增长
-        while (Events.Count > 200)
+        if (response.Events.Count > 0)
         {
-            Events.RemoveAt(Events.Count - 1);
+            _lastTsMs = response.Events[0].TsMs;
         }
 
-        StatusText = $"已连接 · 最近 {Events.Count} 条操作记录（每 2s 自动刷新）";
+        var lastRefresh = DateTimeOffset.Now.ToLocalTime().ToString("HH:mm:ss");
+        // ObservableCollection 只能在 UI 线程修改 → marshal 回 UI（后台轮询线程不可直接改）
+        _uiDispatcher.TryEnqueue(() =>
+        {
+            Events.Clear();
+            foreach (var row in rows)
+            {
+                Events.Add(row);
+            }
+
+            StatusText = $"已连接 · 最近 {Events.Count} 条操作记录（每 2s 自动刷新 · 最后刷新 {lastRefresh}）";
+        });
         _connected = true;
     }
 
