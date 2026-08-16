@@ -14,6 +14,9 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _initialized;
 
+    /// <summary>连接串（诊断/测试用）。</summary>
+    public string ConnectionStringForDebug => _connectionString;
+
     /// <param name="databasePath">SQLite 文件路径；或 ":memory:" / "file:xxx?mode=memory&amp;cache=shared" 内存库（测试用）。</param>
     public SqliteTelemetryStore(string databasePath)
     {

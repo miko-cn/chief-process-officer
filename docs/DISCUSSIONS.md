@@ -295,3 +295,49 @@
 ### 8.3 状态
 - [x] 修复并重新部署验证（用户确认布局正常）
 - [ ] M2 开工
+
+---
+
+## 2026-08-15 会话 ⑨ — M2：策略引擎 + 回放框架 + 决策日志（已完成）
+
+**背景**：用户确认 M1 后开工 M2（SPEC §8：回放框架 + 决策日志 + 基础策略，验收=能离线回放评估策略、优先级/亲和性可用且可恢复）。
+
+### 9.1 M2 已交付
+
+| 模块 | 位置 | 说明 |
+|---|---|---|
+| 规则模型 | `core/Rules/PolicyRule.cs` + `RuleMatcher.cs` | 进程名通配符（\* / ?），SetPriority/SetAffinity/SetBoth，DurationMs，IsEnabled |
+| 策略引擎 | `core/Engine/PolicyEngine.cs` | **纯逻辑决策函数**：规则优先匹配 + 前台进程保护；回放与线上共用 |
+| 确定性屏障 | `core/Engine/ProposalBus.cs` + `ExecutionPath.cs` | 引擎只产建议（ProposalBus），执行只经 ExecutionPath；AI 未来只走建议通道（SPEC 铁律） |
+| 执行路径 | `interop/ProcessController.cs` | SetPriorityClass/SetProcessAffinityMask P/Invoke + 原值记录；`IProcessController` 抽象使 core 零 Win32 依赖 |
+| 干预恢复 | `ExecutionPath` | 记录原值；条件解除/超时（DurationMs）/引擎退出（RestoreAll）自动恢复；恢复动作入决策日志 |
+| 回放框架 | `core/Replay/ReplayRunner.cs` | SQLite 事件流 → 重建帧（进程/系统 CPU）→ 逐帧引擎评估 → 汇总 |
+| 规则存储 | `core/Engine/RuleStore.cs` | JSON 文件持久化 + rule.changed 事件（drain 一次性消费） |
+| 决策日志 | `core/Engine/DecisionLogger.cs` | ProposalBus/ExecutionPath/RuleStore → policy.decision/action/rule.changed 事件 |
+| 策略运行器 | `service/PolicyRunner.cs` | 滑动窗口查询 → 引擎 → 监督（只建议）/自动（执行） |
+| 宿主参数 | `service/Program.cs` | `--engine=auto|supervised`、`--rules=<json>`、内置演示规则（\*build\* 降 BelowNormal） |
+| 工具 | `tools/ReplayDemo/` | 真实轨迹离线回放演示（M2 验收） |
+| 测试 | tests | **83 个 xUnit 全通过**（规则匹配/引擎/执行恢复/回放/日志） |
+
+### 9.2 关键设计与坑（M3 必读）
+
+1. **滑动窗口而非增量窗口**：PolicyRunner 最初用 `_lastSampleMs` 增量查询（from=上次评估时刻），结果**永远查不到刚采的数据**——采样落库有滞后（`SnapshotAll` 枚举 300+ 进程耗时数百 ms，事件 ts 是采样时刻早于评估时刻）。改为**固定 5s 滑动窗口 + 每进程取最新样本**（`latestTsByPid` 比较）。
+2. **冷却期防抖**：超时恢复后下轮评估会立即重新干预（抖动循环）。ExecutionPath 增加 `_lastRestoredMs`：恢复后 DurationMs 内同建议返回 "cooldown"。**恢复时刻必须由调用方传入**（ReapExpired 的 nowMs / Restore 的 UtcNow），否则测试用模拟时间戳时冷却永不结束（`_lastRestoredMs` 被写成真实大数）。
+3. **幂等留痕**：干预期内重复建议返回 "already active"（不重复执行但**仍写 decision 日志**）；`ExecutionEvent.Error` 区分 `null`(执行)/`already active`(幂等)/`cooldown`(冷却)——决策日志可完整还原干预生命周期。
+4. **枚举序列化**：RuleStore JSON 必须配 `JsonStringEnumConverter(CamelCase)`，否则 `"action":"setPriority"` 反序列化抛 JsonException（service 启动即崩，注意区分启动崩溃与运行异常）。
+5. **interop 依赖 core**：ProcessController 用了 core 的 `IProcessController`/`ProcessControlState` → Cpo.Interop.csproj 加 core 引用（M1 时 interop 无依赖）。
+6. **`RuleChangeSource` 命名空间重复**：Telemetry 与 Rules 都有定义 → 删 Rules 版，统一用 Telemetry 的。
+7. **ExecutionEvent 时间**：`ToActionEvent` 用 `ExecutedMs`（动作时刻）而非 `Proposal.TsMs`（建议时刻），测试曾因 20000 vs 12345 暴露。
+
+### 9.3 M2 验收结果（全部达成）
+
+- ✅ **离线回放**：真实轨迹 4207 事件 → ReplayRunner 重建 6 帧 → `*build*` 规则 0 建议（压力进程是 powershell 不匹配，正确）/ `*` 规则 1928 条建议。
+- ✅ **优先级/亲和性可用且可恢复**：实机验证优先级 0x20→0x4000、亲和 0xFFFF→0x3、恢复后完全匹配原值。
+- ✅ **全生命周期闭环**（决策日志还原）：SetPriority 成功 → already active×3 → **Restore 成功**（3s 超时）→ cooldown×2 → 重新干预 → already active×2。policy.decision:10 / policy.action:11 / rule.changed 落盘。
+- ✅ **编译 + 单测强制**：build 0 错误，83/83 通过。
+
+### 9.4 下一步（M3）
+- [ ] 启发式 v1（监督模式）+ 现代化 UI 完整化（引擎建议 → 用户采纳闭环）
+- [ ] 前台检测（GUI 侧 SetWinEventHook → 管道上报，M2 增强：WTSQueryUserToken helper）
+- [ ] GUI↔服务通信：gRPC over named pipes
+- [ ] service 转 Windows 服务形态（LocalSystem）+ 杀软误报对策验证
