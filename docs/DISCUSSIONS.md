@@ -362,3 +362,36 @@
 ### 10.3 备注（M3 前）
 
 - 验证期间 db 曾积累 337 万条事件（多次重启 service + 1s 采样间隔 + 300+ 进程）——本地演示前先清库，或调大采样间隔。默认 30 天保留策略 + 1h 清理周期足够生产，但本地反复验证时库会膨胀。
+
+---
+
+## 2026-08-15 会话 ⑪ — CI 触发策略调整（重要：日常 push 不再触发）
+
+**背景**：用户指出每次 push 都触发 GitHub CI 没必要（当前 workflow 还有报错没跑通，想之后修）。
+
+### 11.1 决策（已同步 SPEC §12）
+
+**CI 只在「打 tag」或「手动触发」时运行，日常 push / PR 不触发。**
+
+`.github/workflows/ci.yml` 的 `on` 改为：
+
+```yaml
+on:
+  push:
+    tags:
+      - 'v*'         # 打 tag（如 v0.1.0）触发
+  workflow_dispatch:  # GitHub Actions 页面手动 "Run workflow"
+```
+
+### 11.2 触发方式速查（未来会话提醒自己）
+
+| 想触发 CI 时 | 命令 / 操作 |
+|---|---|
+| 里程碑/发布节点 | `git tag v0.x.x && git push --tags`（注意：`git push` 不会带 tag，必须 `--tags`） |
+| 按需验证 | GitHub 网页 → Actions → CI → **Run workflow** 按钮（下拉可选手动触发） |
+| 日常提交 | 什么都不用做——push 不触发 CI |
+
+### 11.3 待办（用户明确"之后再搞"）
+
+- **CI workflow 目前有报错没跑通**（M2 期间数次 push 的 Actions 运行失败）。已知嫌疑：windows-latest 上 WinUI 构建（`-p:Platform=x64` 与 sln 平台映射）或测试输出路径；**M3 阶段修复后再打 tag 验证**。修复前不要依赖 CI 结果。
+- 相关：SPEC §12 铁律"每个 PR 必须过 CI"已按新策略表述（见 SPEC 更新）；**核心质量门禁 = 本地 `dotnet build` + `dotnet test`（当前 85/85 通过）**，CI 是发布节点兜底。
