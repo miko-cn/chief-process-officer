@@ -1,9 +1,14 @@
 name: CI
 
+# 触发策略（2026-08-15 调整）：
+# - 普通 push / PR 不触发——日常迭代（含 agent 工作日开发）不跑 CI
+# - 打 tag（v*，如 v0.1.0）触发：发布/里程碑节点验证
+# - 也可在 GitHub Actions 页面手动 "Run workflow" 按需验证
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags:
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build-test:
@@ -29,7 +34,8 @@ jobs:
       - name: Build (x64)
         run: dotnet build Cpo.sln -c Release -p:Platform=x64 --no-restore
 
-      # 铁律（SPEC §12）：每个 PR 必须过 CI（编译 + 单测）；遥测回放测试是核心质量门禁
+      # 铁律（SPEC §12）：编译 + 单测强制；遥测回放测试是核心质量门禁。
+      # 本 workflow 在打 tag / 手动触发时运行（见文件顶部触发策略）。
       - name: Unit tests
         run: dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Release -p:Platform=x64 --no-build --logger "trx;LogFileName=test-results.trx"
 
