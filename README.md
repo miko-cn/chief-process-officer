@@ -5,7 +5,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%201809%2B%20%7C%20Windows%2011-0078D4)
 ![.NET](https://img.shields.io/badge/.NET-8.0-512BD4)
 ![UI](https://img.shields.io/badge/UI-WinUI%203-8A2BE2)
-![Tests](https://img.shields.io/badge/tests-100%2F100-2ea44f)
+![Tests](https://img.shields.io/badge/tests-138%2F138-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-yellowgreen)
 
 ---
@@ -16,7 +16,7 @@
 
 Every intervention is logged, explainable, and reversible. The v1 engine is a **deterministic policy engine** (no AI), but the architecture is AI-ready from day one — AI suggestions will only ever flow through the proposal bus, never the execution path.
 
-- **Status**: M1 ✅ M2 ✅ · M3 (heuristics + modern UI + gRPC security) in progress
+- **Status**: M1 ✅ M2 ✅ · M3 in progress（启发式 v1 ✅ · 三层安全 ✅ · ProBalance 开关 ✅ · 日志审阅 ✅ → 剩余：时间线网格 / 进程表 / 推送化）
 - **Language**: C# / .NET 8 · **UI**: WinUI 3 (Fluent) · **Transport**: gRPC over named pipes
 - **Data**: local SQLite, dual-tier telemetry — privacy-first, never leaves your machine
 
@@ -36,9 +36,10 @@ Every intervention is logged, explainable, and reversible. The v1 engine is a **
 
 ## ✨ 特性
 
-- 🧠 **主动性优化**：启发式自动干预（CPU 风暴检测），而非被动显示；前台进程受保护
+- 🧠 **主动性优化**：启发式自动干预（响应性保护——系统饱和 + 进程挤占 + 非关键三条件齐备才介入），而非被动显示
+- 🛡️ **前台保护**：前台进程本身绝不降级；近期前台（1h）温和降级；其子进程（rg/编译工具等）标准降级——降子进程不影响前台响应
 - ⚙️ **统一策略引擎**：显式规则（进程名通配符匹配）与启发式是同一引擎的两个配置面，规则优先
-- 🔄 **干预可恢复**：记录原值（优先级类 / 亲和性掩码），条件解除、超时、引擎退出时自动恢复，含冷却防抖
+- 🔄 **干预可恢复**：记录原值（优先级类 / 亲和性掩码），条件解除、超时、引擎退出时自动恢复，含冷却防抖；**干预队列持久化落盘，service 强杀/崩溃后启动自动恢复残留**
 - 📝 **决策留痕**：`policy.decision` / `policy.action` 全量落库，人类可读 + 机器可读 JSON 双视图
 - 🎬 **回放框架**：真实负载轨迹离线回放，逐帧评估策略 —— 策略调优不需要等真机卡顿
 - 📊 **遥测即一等公民**：结构化事件流 + 文档化 schema（`docs/schema.md`），SQLite 双表分层存储
@@ -96,7 +97,7 @@ Cpo.sln
 ├─ core/        Cpo.Core 纯逻辑（遥测模型 / 双表存储 / 规则 / 引擎 / 回放，零 OS 依赖）
 ├─ interop/     Cpo.Interop P/Invoke 隔离层（采样 + 进程控制）
 ├─ contracts/   Cpo.Contracts gRPC proto 契约（service + app 共用）
-├─ tests/       xUnit 单测（100 个全绿 = 质量门禁）
+├─ tests/       xUnit 单测（138 个全绿 = 质量门禁）
 ├─ tools/       演示 / 诊断工具（ReplayDemo、demo-rules.json 等）
 └─ docs/        产品规格 / 讨论记录 / 遥测 schema
 ```
@@ -129,7 +130,7 @@ cd chief-process-officer
 # 构建（注意：WinUI 3 项目必须显式指定 x64，AnyCPU 无效）
 dotnet build Cpo.sln -c Debug -p:Platform=x64
 
-# 运行单测（质量门禁：必须 100/100 全绿）
+# 运行单测（质量门禁：必须 138/138 全绿）
 dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug
 ```
 
@@ -158,7 +159,7 @@ powershell -Command "while($true){}"
 
 ## 🧪 测试与质量门禁
 
-- 本地门禁：`dotnet build` 0 错误 + `dotnet test` **100/100 全绿**，提交前必须通过
+- 本地门禁：`dotnet build` 0 错误 + `dotnet test` **138/138 全绿**，提交前必须通过
 - 核心测试面：CPU 计算、进程生命周期、规则匹配、策略引擎、执行路径（恢复/冷却/幂等）、回放框架、SQLite 双表路由、gRPC 管道认证与门卫校验
 - CI 触发策略：日常 push / PR **不触发** CI；打 tag（`v*`）或 GitHub Actions 页面手动触发时运行（编译 + 单测 + Win10/Win11 矩阵）
 
@@ -183,7 +184,9 @@ powershell -Command "while($true){}"
 | M3 | 启发式 v1（自动执行）+ 现代化 UI + gRPC 通信与安全 | 🚧 进行中 |
 | M4 | Windows 服务化（开机自启）+ 打包签名 + 正式发布 | ⏳ 计划 |
 
-**M3 已落地**：双表数据分层、gRPC over named pipes、三层安全（门卫管道 + 会话令牌）、操作日志审阅面板（增量刷新、断线自动重连）、排序确定性修复。
+**M3 已落地**：启发式 v1（响应性保护：系统饱和 + 挤占 + 非关键三条件齐备才介入；前台进程/近期前台两档保护；条件解除提前恢复）、gRPC over named pipes + 三层安全（管道 ACL + 会话令牌 + 门卫对端进程校验）、ProBalance 全局开关（关闭 = 立即恢复全部干预并留痕）、前台检测上报（SetWinEventHook → 引擎前台保护输入）、操作日志审阅面板（增量刷新、断线自动重连、确定性排序）、干预队列持久化（强杀/崩溃后启动自动恢复残留）。
+
+**M3 剩余**：三区审阅面板的时间线网格图（XAML Polyline，零依赖）与全进程视图（虚拟化列表 + 最新样本快照 RPC）、WatchEvents 内存广播推送（替代 500ms DB 轮询假推送）。
 
 **未来（AI 扩展点，v1 只留接口）**：
 
@@ -202,7 +205,7 @@ powershell -Command "while($true){}"
 
 欢迎任何形式的贡献（issue、PR、讨论）。请遵循：
 
-- 提交前本地门禁全绿：`dotnet build` + `dotnet test` 100/100
+- 提交前本地门禁全绿：`dotnet build` + `dotnet test` 138/138
 - 提交信息使用 Conventional Commits 风格（中文描述，如 `fix(app): ...`、`M2: ...`）
 - 重大变更同步更新 `docs/`（SPEC / DISCUSSIONS / schema）
 - CI 仅在打 tag（`v*`）或手动触发时运行，日常迭代不阻塞

@@ -22,7 +22,7 @@ Cpo.sln
 ├─ core/        Cpo.Core 纯逻辑（遥测模型/双表存储/规则/引擎/回放，零 OS 依赖，xUnit 全覆盖）
 ├─ interop/     Cpo.Interop P/Invoke 隔离层（采样 + 进程控制，依赖 core 的接口）
 ├─ contracts/   Cpo.Contracts gRPC proto 契约（service+app 共用）
-├─ tests/       xUnit 单测（当前 127 个全绿 = 质量门禁）
+├─ tests/       xUnit 单测（当前 138 个全绿 = 质量门禁）
 ├─ tools/       演示/诊断工具（ReplayDemo 等）
 └─ docs/        SPEC / DISCUSSIONS / schema / ADR
 ```
@@ -37,7 +37,7 @@ Cpo.sln
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 
 dotnet build Cpo.sln -c Debug -p:Platform=x64      # WinUI 项目必须显式 x64，AnyCPU 无效
-dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（130/130）才允许提交
+dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（138/138）才允许提交
 
 # service 实机运行（遥测录制 + 策略评估 + gRPC 管道）
 service/Cpo.Service/bin/Debug/net8.0/Cpo.Service.exe [--interval-ms=2000] [--engine=auto|supervised] [--rules=<json>]
