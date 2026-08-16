@@ -51,13 +51,23 @@ public sealed class PolicyRunner : IAsyncDisposable
     /// 当前前台进程 PID（GUI 侧 SetWinEventHook 检测后经 gRPC ReportForeground 上报，SPEC §6）。
     /// null = 无前台信息 → 启发式降级保守模式（不主动降后台进程，避免误伤）。
     /// -1 哨兵规避 volatile 对 Nullable&lt;int&gt; 的限制（x64 下 int 读写原子）。
+    /// 设置时同步记录"近期前台历史"（启发式对用户高频使用的程序只做温和降级）。
     /// </summary>
     private volatile int _foregroundPid = -1;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, long> _recentForegroundMs = new();
 
     public int? ForegroundPid
     {
         get => _foregroundPid < 0 ? null : _foregroundPid;
-        set => _foregroundPid = value ?? -1;
+        set
+        {
+            _foregroundPid = value ?? -1;
+            if (value is int pid && pid > 0)
+            {
+                _recentForegroundMs[pid] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+        }
     }
 
     /// <summary>最近一次建议（供 UI/日志展示）。</summary>
@@ -108,11 +118,35 @@ public sealed class PolicyRunner : IAsyncDisposable
             }
         }
 
+        var foregroundPid = ForegroundPid;
+
+        // 前台进程树：用户当前活动的整棵树（含子进程）绝不干预（Toolhelp32 枚举，失败=空集合）
+        var foregroundTree = foregroundPid is int fg
+            ? _controller.GetDescendantPids(fg)
+            : null;
+
+        // 近期前台历史：窗口内曾为前台的进程 → 启发式温和降级（更高阈值 + 更短时长）
+        var recentWindow = Heuristic.RecentForegroundWindowMs;
+        var recentForeground = new HashSet<int>();
+        foreach (var (pid, ts) in _recentForegroundMs)
+        {
+            if (nowMs - ts <= recentWindow)
+            {
+                recentForeground.Add(pid);
+            }
+            else
+            {
+                _recentForegroundMs.TryRemove(pid, out _);   // 惰性清理过期记录
+            }
+        }
+
         var input = new EngineInput
         {
             Processes = latestByPid.Values.ToArray(),
             SystemCpuPercent = systemCpu,
-            ForegroundPid = ForegroundPid, // GUI 侧上报（SPEC §6）；无前台信息时启发式保守
+            ForegroundPid = foregroundPid, // GUI 侧上报（SPEC §6）；无前台信息时启发式保守
+            ForegroundTreePids = foregroundTree,
+            RecentForegroundPids = recentForeground.Count > 0 ? recentForeground : null,
             Rules = _rules.Rules,
             CoreCount = _coreCount,
         };
@@ -135,6 +169,25 @@ public sealed class PolicyRunner : IAsyncDisposable
             {
                 var result = _execution.Execute(proposal);
                 events.Add(DecisionLogger.ToActionEvent(result));
+            }
+        }
+
+        // 条件解除提前恢复（会话⑳b 定案，治"死板"）：启发式干预的目标进程 CPU 已不再挤占
+        // （低于标准挤占阈值）→ 立即恢复原值，不等满超时。规则干预不在此列（尊重用户显式规则语义）。
+        foreach (var active in _execution.ActiveInterventions)
+        {
+            if (active.Value.RuleId is not null)
+            {
+                continue;
+            }
+
+            if (latestByPid.TryGetValue(active.Key, out var current) && current.CpuPercent < Heuristic.ProcessCpuPercent)
+            {
+                var restoreEvt = _execution.Restore(active.Key);
+                if (restoreEvt is not null)
+                {
+                    events.Add(DecisionLogger.ToActionEvent(restoreEvt));
+                }
             }
         }
 

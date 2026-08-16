@@ -43,6 +43,12 @@ internal sealed class FakeProcessController : IProcessController
         Processes[pid] = s with { AffinityMask = mask };
         return new InterventionResult(true, null);
     }
+
+    /// <summary>可配置的进程树（root → 树成员）。默认只含自身（无子进程）。</summary>
+    public Dictionary<int, IReadOnlySet<int>> ProcessTrees { get; } = new();
+
+    public IReadOnlySet<int> GetDescendantPids(int rootPid) =>
+        ProcessTrees.TryGetValue(rootPid, out var tree) ? tree : new HashSet<int> { rootPid };
 }
 
 /// <summary>内存事件存储 fake：支持 PolicyRunner 需要的窗口/前缀查询（按 ts_ms 升序）。</summary>

@@ -40,7 +40,16 @@ public sealed class TelemetryRecorder : IAsyncDisposable
 
         while (await _timer.WaitForNextTickAsync(linked.Token))
         {
-            await SampleOnceAsync(linked.Token);
+            try
+            {
+                await SampleOnceAsync(linked.Token);
+            }
+            catch (Exception ex)
+            {
+                // 单次采样/落盘失败不杀进程（实机教训：SQLite disk I/O error 曾让整个 service 崩溃，
+                // 系统高负载/杀软扫描锁文件时可能发生）。记录后下一轮继续。
+                Console.Error.WriteLine($"[TelemetryRecorder] 采样异常: {ex.Message}");
+            }
         }
     }
 

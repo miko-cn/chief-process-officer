@@ -24,6 +24,18 @@ public sealed record EngineInput
     /// <summary>前台进程 PID（无前台信息时为 null —— 启发式降级保守模式的输入位）。</summary>
     public int? ForegroundPid { get; init; }
 
+    /// <summary>
+    /// 前台进程树（含前台进程自身与全部后代 pid，service 侧枚举传入）。
+    /// 用户当前直接活动的整个进程树：启发式绝不干预（会话⑲+⑳b 定案）。
+    /// </summary>
+    public IReadOnlySet<int>? ForegroundTreePids { get; init; }
+
+    /// <summary>
+    /// 近期（启发式窗口内）曾为前台的进程 pid 集合（service 内存维护）。
+    /// 这些程序是用户高频使用的：启发式只做"温和降级"（更高触发阈值 + 更短时长）。
+    /// </summary>
+    public IReadOnlySet<int>? RecentForegroundPids { get; init; }
+
     /// <summary>用户显式规则（最高优先级输入）。</summary>
     public required IReadOnlyList<PolicyRule> Rules { get; init; }
 

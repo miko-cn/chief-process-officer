@@ -1,6 +1,6 @@
 namespace Cpo.Core.Engine;
 
-/// <summary>一次生效中的干预（记录原值，供恢复）。</summary>
+/// <summary>一次生效中的干预（记录原值，供恢复）。RuleId = 来源规则（null = 启发式干预）。</summary>
 public sealed record ActiveIntervention(
     int Pid,
     string Name,
@@ -9,7 +9,8 @@ public sealed record ActiveIntervention(
     ProposalActionKind Action,
     int? TargetPriorityClass,
     ulong? TargetAffinityMask,
-    ProcessControlState OriginalState);
+    ProcessControlState OriginalState,
+    string? RuleId);
 
 /// <summary>执行事件（供上层写入 policy.action 决策日志）。</summary>
 public sealed record ExecutionEvent(
@@ -109,7 +110,8 @@ public sealed class ExecutionPath
                     Action: proposal.Action,
                     TargetPriorityClass: proposal.PriorityClass,
                     TargetAffinityMask: proposal.AffinityMask,
-                    OriginalState: original);
+                    OriginalState: original,
+                    RuleId: proposal.RuleId);
             }
 
             var execEvent = new ExecutionEvent(proposal, result.Succeeded, result.Error, original, proposal.TsMs);

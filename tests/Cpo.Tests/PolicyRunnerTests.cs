@@ -182,4 +182,77 @@ public class PolicyRunnerTests
             Assert.DoesNotContain(store.Events, e => e.Type == TelemetryEventTypes.PolicyAction);
         }
     }
+
+    [Fact]
+    public async Task Evaluate_Heuristic_SkipsForegroundProcessTree()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        // 前台 999 的进程树包含 42（用户正在用的程序的子进程）→ 绝不干预
+        controller.ProcessTrees[999] = new HashSet<int> { 999, 42 };
+        var runner = CreateHeuristicRunner(store, controller);
+        runner.ForegroundPid = 999;
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+
+            Assert.Empty(controller.Calls);
+            Assert.DoesNotContain(store.Events, e => e.Type == TelemetryEventTypes.PolicyAction);
+        }
+    }
+
+    [Fact]
+    public async Task Evaluate_RestoresWhenConditionClears()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var runner = CreateHeuristicRunner(store, controller);
+        runner.ForegroundPid = 999;
+        await using (runner)
+        {
+            // 风暴：执行降优
+            await runner.EvaluateAsync();
+            Assert.Contains(controller.Calls, c => c == "prio:42=16384");
+
+            // 条件解除：进程 CPU 降到 10%（不再挤占）→ 下一轮立即恢复，不等 30s 超时
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            store.Events.RemoveAll(e => e is CpuSampleEvent { Scope: SampleScope.Process });
+            store.Events.Add(new CpuSampleEvent(now - 1000, SampleScope.Process, 42, "powershell", 10, 500, null, 1000));
+
+            await runner.EvaluateAsync();
+
+            Assert.Contains(controller.Calls, c => c == "prio:42=32");   // 恢复原值 0x20=32
+            Assert.Contains(store.Events, e => e.Type == TelemetryEventTypes.PolicyAction
+                                               && e is PolicyActionEvent { Kind: ActionKind.Restore });
+        }
+    }
+
+    [Fact]
+    public async Task Evaluate_RuleIntervention_NotRestoredOnCpuDrop()
+    {
+        // 规则干预尊重用户显式语义：CPU 降了也不提前恢复（只有启发式干预条件解除恢复）
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var runner = CreateRunner(store, controller, out _);   // 含规则 r1（powershell）
+        runner.ForegroundPid = 999;
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+            Assert.Contains(controller.Calls, c => c == "prio:42=16384");
+
+            // CPU 降了
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            store.Events.RemoveAll(e => e is CpuSampleEvent { Scope: SampleScope.Process });
+            store.Events.Add(new CpuSampleEvent(now - 1000, SampleScope.Process, 42, "powershell", 10, 500, null, 1000));
+
+            await runner.EvaluateAsync();
+
+            // 规则干预仍在生效（未被提前恢复）
+            Assert.DoesNotContain(controller.Calls, c => c == "prio:42=32");
+            Assert.DoesNotContain(store.Events, e => e is PolicyActionEvent { Kind: ActionKind.Restore });
+        }
+    }
 }

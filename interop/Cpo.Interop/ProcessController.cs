@@ -101,6 +101,78 @@ public static partial class ProcessController
     /// <summary>供上层组合的完整控制器（适配 IProcessController 接口）。</summary>
     public static IProcessController CreateController() => new Win32ProcessController();
 
+    /// <summary>
+    /// 进程树枚举（Toolhelp32 快照）：返回 rootPid 自身与全部后代 pid。
+    /// 启发式"前台进程树保护"的数据源（用户当前活动的整个进程树绝不干预）。
+    /// 失败/进程不存在返回空集合（保守：空集合 = 不保护额外进程，不误伤保护能力）。
+    /// </summary>
+    public static IReadOnlySet<int> GetDescendantPids(int rootPid)
+    {
+        try
+        {
+            // 快照全部进程的 (pid, ppid)，构建父子映射后 BFS
+            var snapshot = Native.CreateToolhelp32Snapshot(SnapshotFlags.Process, 0);
+            if (snapshot.IsInvalid)
+            {
+                return new HashSet<int>();
+            }
+
+            try
+            {
+                var children = new Dictionary<int, List<int>>();
+                var entry = new Native.ProcessEntry32 { Size = (uint)Marshal.SizeOf<Native.ProcessEntry32>() };
+                if (Native.Process32First(snapshot, ref entry))
+                {
+                    do
+                    {
+                        var pid = (int)entry.ProcessId;
+                        var ppid = (int)entry.ParentProcessId;
+                        if (ppid > 0)
+                        {
+                            if (!children.TryGetValue(ppid, out var list))
+                            {
+                                list = new List<int>();
+                                children[ppid] = list;
+                            }
+
+                            list.Add(pid);
+                        }
+                    }
+                    while (Native.Process32Next(snapshot, ref entry));
+                }
+
+                // BFS 收集 root 自身 + 全部后代
+                var result = new HashSet<int> { rootPid };
+                var queue = new Queue<int>();
+                queue.Enqueue(rootPid);
+                while (queue.Count > 0)
+                {
+                    var pid = queue.Dequeue();
+                    if (children.TryGetValue(pid, out var kids))
+                    {
+                        foreach (var kid in kids)
+                        {
+                            if (result.Add(kid))
+                            {
+                                queue.Enqueue(kid);
+                            }
+                        }
+                    }
+                }
+
+                return result;
+            }
+            finally
+            {
+                Native.CloseHandle(snapshot);
+            }
+        }
+        catch (Exception)
+        {
+            return new HashSet<int>();
+        }
+    }
+
     private sealed class Win32ProcessController : IProcessController
     {
         public ProcessControlState? GetState(int pid) => ProcessController.GetState(pid);
@@ -110,6 +182,8 @@ public static partial class ProcessController
 
         public InterventionResult SetAffinityMask(int pid, ulong mask) =>
             ProcessController.SetAffinityMask(pid, mask);
+
+        public IReadOnlySet<int> GetDescendantPids(int rootPid) => ProcessController.GetDescendantPids(rootPid);
     }
 
     private static Microsoft.Win32.SafeHandles.SafeProcessHandle OpenProcess(int pid, ProcessAccessFlags access)
@@ -156,6 +230,12 @@ public static partial class ProcessController
         SetInformation = 0x00000200,
     }
 
+    [Flags]
+    internal enum SnapshotFlags : uint
+    {
+        Process = 0x00000002,
+    }
+
     internal static partial class Native
     {
         [DllImport("kernel32.dll", EntryPoint = "OpenProcess", SetLastError = true)]
@@ -183,5 +263,39 @@ public static partial class ProcessController
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetNamedPipeClientProcessId(
             Microsoft.Win32.SafeHandles.SafePipeHandle hNamedPipe, out uint lpdwClientProcessId);
+
+        [DllImport("kernel32.dll", EntryPoint = "CreateToolhelp32Snapshot", SetLastError = true)]
+        internal static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateToolhelp32Snapshot(
+            SnapshotFlags dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool Process32First(
+            Microsoft.Win32.SafeHandles.SafeFileHandle hSnapshot, ref ProcessEntry32 lppe);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32NextW", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool Process32Next(
+            Microsoft.Win32.SafeHandles.SafeFileHandle hSnapshot, ref ProcessEntry32 lppe);
+
+        [DllImport("kernel32.dll", EntryPoint = "CloseHandle", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CloseHandle(Microsoft.Win32.SafeHandles.SafeFileHandle hObject);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct ProcessEntry32
+        {
+            public uint Size;
+            public uint Usage;
+            public uint ProcessId;
+            public nuint DefaultHeapId;
+            public uint ModuleId;
+            public uint Threads;
+            public uint ParentProcessId;
+            public int BasePriority;
+            public uint Flags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string ExeFile;
+        }
     }
 }

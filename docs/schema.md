@@ -109,7 +109,7 @@ GUI 侧 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动产生（见 SPEC
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `tsMs` | long | ✅ | 动作时刻 |
-| `kind` | enum `set_priority` \| `set_affinity` \| `throttle` \| `restore` | ✅ | 动作类型 |
+| `kind` | enum `set_priority` \| `set_affinity` \| `throttle` \| `restore` | ✅ | 动作类型（实际序列化为 camelCase：`setPriority` / `setAffinity` / `throttle` / `restore`，见 §0 枚举约定） |
 | `targetPid` | int | ✅ | 目标进程 |
 | `targetName` | string | ✅ | 目标进程名 |
 | `parameters` | string(JSON) | ✅ | 动作参数（新优先级类/亲和掩码/限流值） |

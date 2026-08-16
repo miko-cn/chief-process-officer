@@ -122,6 +122,11 @@ internal static class Program
         {
             // 正常停止
         }
+        catch (Exception ex)
+        {
+            // 兜底：任何未预期异常都记录后走正常收尾（恢复干预 + 停止服务），不让 service 裸奔崩溃
+            Console.Error.WriteLine($"[Fatal] 未预期异常: {ex}");
+        }
 
         var restored = runner.Shutdown();
         await grpcServer.StopAsync();

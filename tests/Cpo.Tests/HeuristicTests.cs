@@ -103,6 +103,59 @@ public class HeuristicTests
     }
 
     [Fact]
+    public void SkipsForegroundProcessTree()
+    {
+        // 前台进程的子进程（用户当前活动的整棵树）即使挤占也不降（会话⑳b 定案）
+        var input = Input(95, foregroundPid: 100,
+            (100, "editor.exe", 5), (200, "browser-render.exe", 95)) with
+        {
+            ForegroundTreePids = new HashSet<int> { 100, 200 },   // 200 是前台 100 的子进程
+        };
+
+        var proposals = PolicyEngine.Evaluate(input, DefaultConfig);
+
+        Assert.Empty(proposals);
+    }
+
+    [Fact]
+    public void RecentForeground_GentlerThreshold()
+    {
+        // 近期前台程序：标准阈值 50 命中但温和阈值 80 不命中（60%）→ 不降（谨慎）
+        var input = Input(95, foregroundPid: 100,
+            (100, "editor.exe", 5), (200, "browser.exe", 60)) with
+        {
+            RecentForegroundPids = new HashSet<int> { 200 },
+        };
+
+        Assert.Empty(PolicyEngine.Evaluate(input, DefaultConfig));
+
+        // 严重挤占（90% ≥ 80）→ 温和降级：更短时长（10s）
+        var severe = input with
+        {
+            Processes = new[]
+            {
+                new ProcessState(100, "editor.exe", 5, 0),
+                new ProcessState(200, "browser.exe", 90, 0),
+            },
+        };
+        var proposal = Assert.Single(PolicyEngine.Evaluate(severe, DefaultConfig));
+        Assert.Equal(10_000, proposal.DurationMs);   // 温和时长而非标准 30s
+        Assert.Contains("近期前台", proposal.Reason); // 理由可解释
+    }
+
+    [Fact]
+    public void RecentForeground_NotInSet_UsesStandardParams()
+    {
+        // 不在近期前台集合 → 标准参数（50% 触发 / 30s）
+        var input = Input(95, foregroundPid: 100,
+            (100, "editor.exe", 5), (200, "compiler.exe", 60));
+
+        var proposal = Assert.Single(PolicyEngine.Evaluate(input, DefaultConfig));
+        Assert.Equal(30_000, proposal.DurationMs);
+        Assert.DoesNotContain("近期前台", proposal.Reason);
+    }
+
+    [Fact]
     public void SkipsLowCpuProcess()
     {
         // 饱和但进程不是挤占者（20% 单核）→ 不干预

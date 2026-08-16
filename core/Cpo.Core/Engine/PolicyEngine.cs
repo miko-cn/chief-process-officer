@@ -53,34 +53,60 @@ public static class PolicyEngine
                 continue; // 规则优先：命中规则的进程不再走启发式
             }
 
-            if (heuristicArmed && IsHeuristicTarget(process, heuristic!))
+            if (!heuristicArmed)
             {
-                proposals.Add(BuildHeuristicProposal(now, process, input.SystemCpuPercent, heuristic!));
+                continue;
+            }
+
+            // 前台进程树（用户当前直接活动的整棵树）：绝不干预
+            if (input.ForegroundTreePids?.Contains(process.Pid) == true)
+            {
+                continue;
+            }
+
+            // 近期前台程序（用户高频使用）：温和降级（更高阈值 + 更短时长）
+            var recentForeground = input.RecentForegroundPids?.Contains(process.Pid) == true;
+            if (IsHeuristicTarget(process, heuristic!, recentForeground))
+            {
+                proposals.Add(BuildHeuristicProposal(now, process, input.SystemCpuPercent, heuristic!, recentForeground));
             }
         }
 
         return proposals;
     }
 
-    /// <summary>启发式目标判定（三条件中的后两条：挤占者 + 非关键；系统饱和已由调用方保证）。</summary>
-    private static bool IsHeuristicTarget(ProcessState process, HeuristicConfig heuristic) =>
-        process.CpuPercent >= heuristic.ProcessCpuPercent
-        && !SystemCriticalNames.Contains(process.Name);
+    /// <summary>启发式目标判定（三条件中的后两条：挤占者 + 非关键；系统饱和已由调用方保证）。
+    /// 近期前台程序用更高的挤占阈值（更谨慎才动它）。</summary>
+    private static bool IsHeuristicTarget(ProcessState process, HeuristicConfig heuristic, bool recentForeground)
+    {
+        var threshold = recentForeground ? heuristic.RecentForegroundCpuPercent : heuristic.ProcessCpuPercent;
+        return process.CpuPercent >= threshold
+               && !SystemCriticalNames.Contains(process.Name);
+    }
 
     private static PolicyProposal BuildHeuristicProposal(
-        long now, ProcessState process, double systemCpuPercent, HeuristicConfig heuristic) => new()
+        long now, ProcessState process, double systemCpuPercent, HeuristicConfig heuristic, bool recentForeground)
     {
-        TsMs = now,
-        Trigger = "heuristic.saturation",
-        TargetPid = process.Pid,
-        TargetName = process.Name,
-        Action = ProposalActionKind.SetPriority,
-        PriorityClass = heuristic.PriorityClass,
-        DurationMs = heuristic.DurationMs,
-        Reason = $"启发式: 系统 CPU 饱和（{systemCpuPercent:0}%），进程 {process.Name} 挤占 {process.CpuPercent:0}%，" +
-                 $"建议优先级 → {DescribePriority(heuristic.PriorityClass)}（{heuristic.DurationMs / 1000} 秒后自动恢复）",
-        RuleId = null,
-    };
+        var durationMs = recentForeground ? heuristic.RecentForegroundDurationMs : heuristic.DurationMs;
+        var reason = recentForeground
+            ? $"启发式: 系统 CPU 饱和（{systemCpuPercent:0}%），近期前台程序 {process.Name} 严重挤占 {process.CpuPercent:0}%，" +
+              $"谨慎降级 → {DescribePriority(heuristic.PriorityClass)}（{durationMs / 1000} 秒后自动恢复）"
+            : $"启发式: 系统 CPU 饱和（{systemCpuPercent:0}%），进程 {process.Name} 挤占 {process.CpuPercent:0}%，" +
+              $"建议优先级 → {DescribePriority(heuristic.PriorityClass)}（{durationMs / 1000} 秒后自动恢复）";
+
+        return new PolicyProposal
+        {
+            TsMs = now,
+            Trigger = "heuristic.saturation",
+            TargetPid = process.Pid,
+            TargetName = process.Name,
+            Action = ProposalActionKind.SetPriority,
+            PriorityClass = heuristic.PriorityClass,
+            DurationMs = durationMs,
+            Reason = reason,
+            RuleId = null,
+        };
+    }
 
     private static PolicyRule? FirstMatchingRule(IReadOnlyList<PolicyRule> rules, string processName)
     {

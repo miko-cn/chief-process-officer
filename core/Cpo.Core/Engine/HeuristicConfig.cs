@@ -23,4 +23,15 @@ public sealed record HeuristicConfig
 
     /// <summary>目标优先级类（0x4000 = BelowNormal，保守起步，不高于此强度）。</summary>
     public int PriorityClass { get; init; } = 0x4000;
+
+    // ─── 近期前台程序（用户高频使用）的温和降级参数（会话⑳b 定案）───
+
+    /// <summary>温和降级窗口（毫秒）：窗口内曾为前台 → 按温和参数谨慎降级。</summary>
+    public long RecentForegroundWindowMs { get; init; } = 60 * 60_000;
+
+    /// <summary>温和降级的挤占阈值（0~100）：比标准更高 = 更严重的挤占才动它。</summary>
+    public double RecentForegroundCpuPercent { get; init; } = 80;
+
+    /// <summary>温和降级时长（毫秒）：更短 = 更快松手。</summary>
+    public long RecentForegroundDurationMs { get; init; } = 10_000;
 }
