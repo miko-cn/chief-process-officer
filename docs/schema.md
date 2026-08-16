@@ -78,7 +78,7 @@
 
 ## 4. ui.foreground — 前台窗口变化
 
-GUI 侧 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动产生（见 SPEC §6 前台检测归属决策）。
+GUI 侧 `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` 事件驱动产生（见 SPEC §6 前台检测归属决策）。**已落地（M3 会话⑳）**：app 经 gRPC `ReportForeground` 上报，service 写入引擎前台输入并落盘本事件；`windowTitle` 留 null（隐私红线，见 §10）。
 
 | 字段 | 类型 | 单位 | 必填 | 说明 |
 |---|---|---|---|---|

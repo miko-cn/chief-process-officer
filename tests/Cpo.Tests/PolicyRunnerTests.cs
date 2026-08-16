@@ -115,4 +115,71 @@ public class PolicyRunnerTests
             Assert.Equal("app", toggled.Source);
         }
     }
+
+    // ─── 启发式（响应性保护）+ 前台输入集成 ───
+
+    /// <summary>无显式规则的 runner：启发式是唯一决策来源（验证启发式真实链路）。</summary>
+    private static PolicyRunner CreateHeuristicRunner(FakeTelemetryStore store, FakeProcessController controller)
+    {
+        var runner = new PolicyRunner(store, controller, new RuleStore(), coreCount: 8)
+        {
+            Mode = DecisionMode.Automatic,
+            InterventionEnabled = true,
+        };
+        runner.Heuristic = new HeuristicConfig();   // 默认保守配置（系统饱和 90% / 进程 50% / 30s）
+        return runner;
+    }
+
+    [Fact]
+    public async Task Evaluate_Heuristic_NoForegroundInfo_DoesNotExecute()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var runner = CreateHeuristicRunner(store, controller);
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+
+            // 无前台信息 → 启发式保守模式：不干预（SPEC §6 定案）
+            Assert.Empty(controller.Calls);
+            Assert.DoesNotContain(store.Events, e => e.Type == TelemetryEventTypes.PolicyAction);
+        }
+    }
+
+    [Fact]
+    public async Task Evaluate_Heuristic_ForegroundSet_ExecutesBackgroundHogger()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var runner = CreateHeuristicRunner(store, controller);
+        runner.ForegroundPid = 999;   // 前台是别的进程（GUI 上报）
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+
+            // 系统饱和 + 后台挤占者 → 启发式触发：降为 BelowNormal (0x4000=16384)
+            Assert.Contains(controller.Calls, c => c == "prio:42=16384");
+            var decision = store.Events.OfType<PolicyDecisionEvent>().Single();
+            Assert.Contains("heuristic.saturation", decision.Trigger);
+        }
+    }
+
+    [Fact]
+    public async Task Evaluate_Heuristic_ForegroundIsHogger_Skips()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var runner = CreateHeuristicRunner(store, controller);
+        runner.ForegroundPid = 42;    // 挤占者就是前台（用户正在用）→ 保护不降
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+
+            Assert.Empty(controller.Calls);
+            Assert.DoesNotContain(store.Events, e => e.Type == TelemetryEventTypes.PolicyAction);
+        }
+    }
 }

@@ -34,6 +34,12 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     /// <summary>会话令牌（门卫管道经对端进程校验后发放，只存内存不落盘）。null = 未握手/已失效。</summary>
     private string? _sessionToken;
 
+    /// <summary>前台监听（SetWinEventHook，UI 线程回调；SPEC §6 前台检测归属定案）。</summary>
+    private readonly Cpo.App.Native.ForegroundWatcher _foregroundWatcher = new();
+
+    /// <summary>最近一次前台（pid, name）：service 重启（令牌重取）后补报用。</summary>
+    private (int Pid, string Name)? _lastForeground;
+
     /// <summary>
     /// 干预开关同步标志：程序侧（GetStatus 刷新/失败回滚）同步 IsInterventionEnabled 时置位，
     /// 防止 TwoWay 绑定把程序同步误判为用户操作而触发 gRPC 调用（死循环）。
@@ -124,9 +130,18 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
         _client = CreateClient();
         _timer = new PeriodicTimer(TimeSpan.FromSeconds(2));
 
+        // 前台监听：hook 事件上报 + 启动时立即上报当前前台（service 侧启发式的前台保护输入）
+        _foregroundWatcher.ForegroundChanged += OnForegroundChanged;
+        _foregroundWatcher.Start();
+
         try
         {
-            await EnsureSessionAsync();
+            // 首次握手后立即补报前台（hook 启动时可能早于令牌就绪，上报被静默丢弃）
+            if (await EnsureSessionAsync() && _lastForeground is { } fg)
+            {
+                await ReportForegroundAsync(fg.Pid, fg.Name);
+            }
+
             await RefreshStatusAsync();
             await PollAsync();
         }
@@ -169,6 +184,8 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
 
     public void Dispose()
     {
+        _foregroundWatcher.ForegroundChanged -= OnForegroundChanged;
+        _foregroundWatcher.Dispose();
         _cts?.Cancel();
         _cts?.Dispose();
         _timer?.Dispose();
@@ -199,15 +216,37 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
 
     /// <summary>
     /// 确保持有有效会话令牌：无令牌时先经门卫管道握手（service 侧校验对端进程必须是 Cpo.App.exe）。
+    /// 返回是否**新获取**了令牌（true = 刚握手，调用方应补报前台等状态）。
     /// </summary>
-    private async Task EnsureSessionAsync(CancellationToken ct = default)
+    private async Task<bool> EnsureSessionAsync(CancellationToken ct = default)
     {
         if (_sessionToken is not null)
         {
-            return;
+            return false;
         }
 
         _sessionToken = await RequestSessionTokenAsync(ct);
+        return true;
+    }
+
+    /// <summary>前台变化（hook 回调，UI 线程）：记录 + 上报 service（失败静默，Poll 补报兜底）。</summary>
+    private void OnForegroundChanged(int pid, string name)
+    {
+        _lastForeground = (pid, name);
+        _ = ReportForegroundAsync(pid, name);
+    }
+
+    private async Task ReportForegroundAsync(int pid, string name)
+    {
+        try
+        {
+            await _client!.ReportForegroundAsync(
+                new ForegroundReportRequest { Pid = pid, Name = name }, WithAuth());
+        }
+        catch
+        {
+            // 静默：service 未起/令牌未就绪时忽略，PollAsync 每次新握手后补报
+        }
     }
 
     /// <summary>门卫握手：连接 cpo-gate-&lt;user&gt;，经对端进程校验后领取会话令牌（内存态，不落盘）。</summary>
@@ -252,7 +291,11 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     /// <summary>拉取最新事件（倒序，Limit 20），与现有列表做增量合并：无变化 → 零操作（不闪烁）。</summary>
     private async Task PollAsync()
     {
-        await EnsureSessionAsync();
+        // 新握手（service 重启后令牌失效重取）→ 补报前台，保证启发式前台保护持续有效
+        if (await EnsureSessionAsync() && _lastForeground is { } fg)
+        {
+            await ReportForegroundAsync(fg.Pid, fg.Name);
+        }
 
         var response = await _client!.QueryEventsAsync(new QueryEventsRequest
         {

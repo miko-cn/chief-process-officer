@@ -219,4 +219,27 @@ public class GrpcNamedPipeTests : IAsyncLifetime
         Assert.Contains("\"enabled\":false", toggled.PayloadJson);   // schema JSON 契约原样
         Assert.Contains("\"source\":\"app\"", toggled.PayloadJson);
     }
+
+    [Fact]
+    public async Task ReportForeground_UpdatesRunnerAndLogs()
+    {
+        var client = CreateClient();
+        var token = IssueToken();
+
+        await client.ReportForegroundAsync(
+            new ForegroundReportRequest { Pid = 42, Name = "editor" }, AuthCall(token));
+
+        // 引擎侧前台输入已更新（启发式的前台保护依据）
+        Assert.Equal(42, _runner.ForegroundPid);
+
+        // ui.foreground 事件落盘（schema §4）
+        var response = await client.QueryEventsAsync(new QueryEventsRequest
+        {
+            TypePrefix = "ui.",
+        }, AuthCall(token));
+        var foreground = Assert.Single(response.Events);
+        Assert.Equal(TelemetryEventTypes.Foreground, foreground.Type);
+        Assert.Contains("\"pid\":42", foreground.PayloadJson);
+        Assert.Contains("\"name\":\"editor\"", foreground.PayloadJson);
+    }
 }

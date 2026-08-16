@@ -101,6 +101,17 @@ public sealed class TelemetryGrpcService : Contracts.Telemetry.TelemetryService.
         return await GetStatus(new GetStatusRequest(), context);
     }
 
+    public override async Task<global::Cpo.Contracts.Telemetry.ForegroundReportResponse> ReportForeground(
+        ForegroundReportRequest request, ServerCallContext context)
+    {
+        // 前台状态进入引擎（启发式的前台保护输入）+ 落盘 ui.foreground 事件（schema §4，可审计）
+        _runner.ForegroundPid = request.Pid;
+        await _store.AppendAsync(new ForegroundEvent(
+            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), request.Pid, request.Name, null),
+            context.CancellationToken);
+        return new global::Cpo.Contracts.Telemetry.ForegroundReportResponse();
+    }
+
     private static TelemetryEventEnvelope ToEnvelope(TelemetryEvent evt) => new()
     {
         TsMs = evt.TsMs,

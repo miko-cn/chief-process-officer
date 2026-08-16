@@ -9,6 +9,16 @@ option csharp_namespace = "Cpo.Contracts.Telemetry";
 // 事件信封 payload_json 直接复用 docs/schema.md 的 camelCase JSON 契约，
 // 由 core 的 TelemetryEventSerializer 序列化/反序列化，UI 层零改动。
 
+// ─── 前台进程上报（SPEC §6 前台检测归属定案：GUI 侧 SetWinEventHook 检测 → 经管道上报）───
+
+// 前台进程上报请求
+message ForegroundReportRequest {
+  int32 pid = 1;      // 前台进程 PID
+  string name = 2;    // 进程名（无 .exe 后缀，与 Process.ProcessName 一致）
+}
+
+message ForegroundReportResponse {}
+
 // 遥测服务：查询 + 实时订阅（审阅面板数据源）
 service TelemetryService {
   // 查询事件（按类型/时间范围/PID/分页，可倒序取最新）
@@ -22,6 +32,9 @@ service TelemetryService {
 
   // ProBalance 开关（M3，会话⑫定案）：只控制自动干预执行；遥测/日志/服务继续运行
   rpc SetInterventionEnabled(SetInterventionEnabledRequest) returns (ServiceStatus);
+
+  // 前台进程上报（GUI 侧 SetWinEventHook 检测 → 经管道上报；SPEC §6 前台检测归属定案）
+  rpc ReportForeground(ForegroundReportRequest) returns (ForegroundReportResponse);
 }
 
 // ─── 事件信封 ───

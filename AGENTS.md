@@ -22,7 +22,7 @@ Cpo.sln
 ├─ core/        Cpo.Core 纯逻辑（遥测模型/双表存储/规则/引擎/回放，零 OS 依赖，xUnit 全覆盖）
 ├─ interop/     Cpo.Interop P/Invoke 隔离层（采样 + 进程控制，依赖 core 的接口）
 ├─ contracts/   Cpo.Contracts gRPC proto 契约（service+app 共用）
-├─ tests/       xUnit 单测（当前 106 个全绿 = 质量门禁）
+├─ tests/       xUnit 单测（当前 121 个全绿 = 质量门禁）
 ├─ tools/       演示/诊断工具（ReplayDemo 等）
 └─ docs/        SPEC / DISCUSSIONS / schema / ADR
 ```
@@ -37,7 +37,7 @@ Cpo.sln
 $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 
 dotnet build Cpo.sln -c Debug -p:Platform=x64      # WinUI 项目必须显式 x64，AnyCPU 无效
-dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（106/106）才允许提交
+dotnet test tests/Cpo.Tests/Cpo.Tests.csproj -c Debug   # 全绿（121/121）才允许提交
 
 # service 实机运行（遥测录制 + 策略评估 + gRPC 管道）
 service/Cpo.Service/bin/Debug/net8.0/Cpo.Service.exe [--interval-ms=2000] [--engine=auto|supervised] [--rules=<json>]
@@ -71,7 +71,9 @@ cd app/Cpo.App && winapp run . --detach
 | 策略输入 | 固定滑动窗口（5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
 | 干预防抖 | 恢复后 DurationMs 内冷却（`_lastRestoredMs`），恢复时刻由调用方传入 |
 | ProBalance 开关 | 执行干预 ⇔ `Mode==Automatic && InterventionEnabled`（volatile 字段）；关闭 = 立即 RestoreAll 并留痕；切换事件 `policy.intervention_toggled`（schema §8）；App ToggleSwitch TwoWay 绑定必须配同步标志（`SyncInterventionEnabled`）防程序刷新误触发 gRPC |
+| 启发式（响应性保护） | 目标 = OS/前台响应性，降 CPU 是手段不是指标（会话⑲）；触发三条件齐备：系统饱和（≥90%）+ 进程挤占（≥50%）+ 非关键（非前台/非系统关键名单，**含引擎自身 cpo.service/cpo.app**）；无前台信息 = 整体保守跳过；规则永远优先 |
 | gRPC named pipes | 契约在 `contracts/Cpo.Contracts`；服务端 `UseNamedPipes(o => o.CurrentUserOnly=true)` + `ListenNamedPipe("cpo-telemetry-<user>")`；客户端 `GrpcChannel.ForAddress` + SocketsHttpHandler.ConnectCallback 返回 NamedPipeClientStream（无 TransportType 选项）；**gRPC 是传输层，事件信封 payload_json 复用 schema JSON** |
+| proto 定义顺序 | **service 引用的 message 必须先定义**（Grpc.Tools 2.67 实测：message 在 service 之后报 "not defined"，前向引用不被接受）；注意 RPC 名与 message 名前缀相反易写反（`ReportForeground` vs `ForegroundReportResponse`） |
 | gRPC 安全 | 默认 ACL 允许同用户任意进程连接！必须 `CurrentUserOnly=true`（防其他用户）+ `AuthInterceptor` 会话令牌校验（防同用户任意进程）；**会话令牌来自门卫管道 `cpo-gate-<user>`**（握手时 `GetNamedPipeClientProcessId` 校验对端必须是 Cpo.App.exe → 发放 256-bit 内存令牌，12h 不落盘；文件令牌已废弃）；客户端先握手再调用，`Unauthenticated` 时清令牌自动重握手 |
 | gRPC 服务类命名 | proto 生成的静态类 `TelemetryService` 占用类名 → 实现类用 `TelemetryGrpcService` |
 | FileSecurity | 在 `System.IO.FileSystem.AccessControl` 包，命名空间 `System.Security.AccessControl`；用 `FileInfo.SetAccessControl` 而非 `File.SetAccessControl` |

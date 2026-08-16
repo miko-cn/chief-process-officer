@@ -34,12 +34,14 @@ public static class ReplayRunner
     /// <param name="rules">回放时使用的规则集（与线上同一规则模型）。</param>
     /// <param name="coreCount">系统核心数（影响系统 CPU 展示，不影响规则匹配）。</param>
     /// <param name="foregroundPid">可选：回放期间假设的前台进程（null = 无前台信息保守模式）。</param>
+    /// <param name="heuristic">可选：启发式配置（null = 只跑显式规则，与线上同一参数管线）。</param>
     /// <param name="maxFrames">最多回放帧数（大轨迹防爆）。</param>
     public static ReplaySummary Evaluate(
         IEnumerable<TelemetryEvent> events,
         IReadOnlyList<PolicyRule> rules,
         int coreCount,
         int? foregroundPid = null,
+        HeuristicConfig? heuristic = null,
         int maxFrames = 100_000)
     {
         var frames = BuildFrames(events, maxFrames);
@@ -59,7 +61,7 @@ public static class ReplayRunner
                 CoreCount = coreCount,
             };
 
-            var proposals = PolicyEngine.Evaluate(input);
+            var proposals = PolicyEngine.Evaluate(input, heuristic);
             proposalCount += proposals.Count;
             ruleProposalCount += proposals.Count(p => p.RuleId is not null);
         }

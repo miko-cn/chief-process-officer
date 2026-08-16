@@ -121,4 +121,27 @@ public class ReplayRunnerTests
         Assert.Equal(0, summary.FrameCount);
         Assert.Equal(0, summary.TotalProposals);
     }
+
+    [Fact]
+    public void Evaluate_Heuristic_SaturatedFramesPropose_UnsaturatedDont()
+    {
+        // 无规则 + 有前台信息：饱和帧（系统 95% + 后台 95%）→ 启发式建议；余量帧（60%）→ 不建议
+        var events = BuildEvents(
+            new ProcessLifecycleEvent(100, LifecycleKind.Started, 1, 0, "fg.exe", null),
+            new ProcessLifecycleEvent(100, LifecycleKind.Started, 2, 0, "hog.exe", null),
+            new CpuSampleEvent(110, SampleScope.Process, 1, "fg.exe", 5, 1000, null, 1000),
+            new CpuSampleEvent(110, SampleScope.Process, 2, "hog.exe", 95, 2000, null, 1000),
+            new CpuSampleEvent(120, SampleScope.System, null, null, 95, 100, 8, 1000),   // 饱和帧
+            new CpuSampleEvent(200, SampleScope.System, null, null, 60, 200, 8, 1000));  // 余量帧
+
+        var withHeuristic = ReplayRunner.Evaluate(
+            events, Array.Empty<PolicyRule>(), coreCount: 8, foregroundPid: 1, heuristic: new HeuristicConfig());
+        var withoutHeuristic = ReplayRunner.Evaluate(
+            events, Array.Empty<PolicyRule>(), coreCount: 8, foregroundPid: 1);
+
+        Assert.Equal(2, withHeuristic.FrameCount);
+        Assert.Equal(1, withHeuristic.TotalProposals);    // 只有饱和帧产生建议
+        Assert.Equal(0, withHeuristic.MatchedRuleProposals);  // 纯启发式建议
+        Assert.Equal(0, withoutHeuristic.TotalProposals); // 不传启发式 = 纯规则模式
+    }
 }

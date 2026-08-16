@@ -629,3 +629,81 @@ on:
 ### 18.3 备注
 - GetStatus 的 `intervention_enabled` 字段从"Mode==Automatic 的映射"改为真实开关值（此前该字段恒等于引擎模式，现为独立运行时状态）
 - 遗留（M3 剩余）：启发式 v1（CPU 风暴，保守）、审阅面板增强（进程过滤/时间线/恢复状态）、WatchEvents 真推送（当前 500ms 轮询）
+
+## 2026-08-16 会话 ⑲ — M3 续项方向定案：启发式目标重定义 + 审阅面板三区布局 + WatchEvents 抗卡顿要求
+
+**背景**：用户审阅 M3 剩余 3 项待办后给出方向性指示（三条），本会话记录为正式决策并调研图表实现方案。
+
+### 19.1 启发式目标重定义（响应性导向，非占用率导向）——最高优先级决策
+
+**用户原话要点**：启发式的目标 = **保持操作系统、前台程序的高响应性**；降低 CPU 高挤占率是实现**手段**，不是硬性指标。**绝不**出现"CPU 明明还有空间给 OS/前台，却把本来能跑的进程降级"。
+
+**推论（写入 SPEC §1/§5）**：
+- 触发条件 ≠ "进程 CPU 高"。触发条件 = **系统 CPU 已饱和（无余量给 OS/前台）+ 该进程是挤占者 + 非关键（非前台/非系统关键）** 三者同时成立
+- 系统还有余量（如 8 核空闲 2 核）→ 任何进程吃满 CPU 都合理 → **不干预**
+- 直接信号（未来增强）：前台进程被饿着（runnable 等待）时优先响应；v1 保守实现用"系统总 CPU 接近饱和"作为拥挤度代理
+- 启发式 v1 命名从"CPU 风暴检测"改为"**响应性保护（conservative）**"
+- 前台保护、完整恢复、审阅面板信任闭环等既有定案不变
+
+### 19.2 审阅面板三区布局定案（参照 Process Lasso）
+
+**用户指示**：核心面板就三个区域——① 资源占用率时间线网格图 ② 当前全部进程情况（目标：比任务管理器更好用、响应更快）③ 操作日志审阅面板（现有）。
+
+**图表方案调研（winui-search）结论**：
+
+| 方案 | 优点 | 缺点 | 适配度 |
+|---|---|---|---|
+| **XAML Polyline + Points 绑定** | 零第三方依赖；几百点内性能开销极低（2s 采样、5 分钟视图≈150 点）；无原生库、无版本兼容风险；Fluent 主题/高对比度完全可控 | 无现成轴/网格/tooltip，需自绘静态网格线（Grid + Line + TextBlock，一次性成本） | ★★★★★ 推荐 |
+| LiveCharts2（SkiaSharp） | 现成轴/网格/动画/缩放；官方有实时滚动示例 | 依赖 SkiaSharp 原生库（体积+兼容风险）；动画默认开（与"简洁无动画"定案相悖，需关）；包更新风险 | ★★★ 可选 |
+| Win2D 自绘 | 性能天花板最高（上万点） | 代码量最大（坐标变换/轴/网格全手写）；我们点数规模用不上 | ★★ 过度设计 |
+
+**定案**：时间线网格图用 **XAML Polyline + 静态 XAML 网格线**（零依赖 + 低开销 + 主题可控），数据 = samples 表最近 N 分钟（系统级 + 前台/关键进程级曲线）。进程表（区 2）用虚拟化 ListView（几百行必须虚拟化，与日志列表的非虚拟化 StackPanel 决策不同——行数数量级不同）。区 2 数据源需新增 gRPC 快照查询（最新每进程样本），区 1 用 QueryEvents 既有能力。
+
+### 19.3 WatchEvents 真推送 + 抗卡顿要求
+
+**用户指示**：认可升级为真实流推送；但**抗卡顿是硬要求**——即使 OS 卡（键盘/鼠标响应慢），用户也要能快速通过工具确认 ① ProBalance 是否生效 ② 进程占用率是否快速刷新，帮助定位问题。
+
+**推论**：
+- 推送通道不能依赖会被系统卡顿拖慢的路径：内存广播（评估时直接推订阅流）优于 DB 轮询（卡顿时 I/O 排队）
+- app 侧数据面（进程快照/时间线）也要走"内存态 + 低开销渲染"，不能因系统忙而大幅延迟
+- UI 渲染保持轻量（无动画、非虚拟化小列表、增量更新）——系统忙时 UI 线程要让给数据渲染
+- 采样时间戳真实反映采集时刻（用户对比"卡顿时数据是否还在走"）
+- 这是 M3 收尾项；验收时用 CPU 风暴实机压测"卡顿时面板数据仍流畅刷新"
+
+## 2026-08-16 会话 ⑳ — 启发式 v1（响应性保护）落地 + 前台检测接入
+
+**背景**：会话⑲定案启发式目标（响应性导向）后本会话实现。实现过程中发现启发式实机生效的前置依赖——前台检测——尚未接入（PolicyRunner.ForegroundPid 恒为 null → 启发式永远保守跳过），一并落地。
+
+### 20.1 启发式 v1（core/PolicyEngine + HeuristicConfig）
+
+- **触发 = 三条件齐备**（会话⑲定案）：① 系统 CPU 饱和（默认 ≥90%，`HeuristicConfig.SystemSaturationPercent`）② 进程挤占（默认 ≥50% 单核，`ProcessCpuPercent`）③ 非关键（非前台 + 非系统关键名单）
+- **动作保守**：SetPriority → BelowNormal（0x4000），时长 30s（`DurationMs`），超时由 ExecutionPath 自动恢复；全部参数化（`HeuristicConfig`，SPEC §7 配置化定案）
+- **规则始终优先**：显式规则命中的进程不走启发式（同一引擎两个配置面）
+- **无前台信息 = 启发式整体保守跳过**（SPEC §6 定案：不主动降后台进程）
+- 系统关键名单含引擎自身 `cpo.service`/`cpo.app`——**实机发现**：系统 100% 饱和时采样/评估进程自身 CPU 也高，启发式差点把自己降了（已修 + 测试 SkipsEngineItself）
+- Trigger 值 `heuristic.saturation`，理由含系统 CPU + 进程 CPU + 时长（决策日志可解释）
+
+### 20.2 前台检测接入（SPEC §6 定案落地：GUI 侧检测 → 管道上报）
+
+- `app/Cpo.App/Native/ForegroundWatcher.cs`：SetWinEventHook(EVENT_SYSTEM_FOREGROUND) + GetForegroundWindow/GetWindowThreadProcessId（P/Invoke），UI 线程注册（WINEVENT_OUTOFCONTEXT 回调即 UI 线程）
+- proto 新 RPC `ReportForeground(ForegroundReportRequest{pid,name})`；service 侧：`PolicyRunner.ForegroundPid`（volatile int，-1 哨兵规避 Nullable volatile 限制）+ 落盘 `ui.foreground` 事件（schema §4 首次真实产生）
+- app 上报时机：hook 事件 + 启动时立即上报 + **每次新握手后补报**（service 重启自愈——首次握手结果曾被丢弃导致不补报，已修）
+- 上报失败静默（无令牌时），Poll 补报兜底
+
+### 20.3 验证（全链路实机）
+
+- ✅ 121/121 单测全绿（+5：HeuristicTests 10 个含 SkipsEngineItself、PolicyRunner 启发式集成 3 个、gRPC ReportForeground 1 个、ReplayRunner 启发式 1 个）
+- ✅ ui.foreground 实时上报：app 启动 → explorer → QQ 切换均落盘（`{"pid":32172,"name":"QQ"}`）
+- ✅ **启发式实机触发**：2×隐藏 powershell 风暴 → 系统 100% → `policy.decision` trigger=`heuristic.saturation`（powershell 97% → BelowNormal/30s），决策理由完整可解释
+- ✅ **30s 自动恢复**：`policy.action` kind=`restore` 落盘；进程已消失的干预静默移除（ReapExpired 既有设计）
+- ✅ 引擎不自伤：第二轮风暴只降 powershell ×2 + chrome，无 Cpo.Service
+
+### 20.4 坑（proto 定义顺序）
+
+- **protoc（Grpc.Tools 2.67）要求 service 引用的 message 必须先定义**（本会话实测：message 定义在 service 之后报 "XXX is not defined"，移动到 service 之前即通过；与 proto3 规范的前向引用允许相悖，工具版本行为如此）——已在 AGENTS.md 坑表记录
+- C# 侧：RPC 名 `ReportForeground` vs message 名 `ForegroundReportRequest/Response` 易写反（本会话把 Response 写成 `ReportForegroundResponse` 排查良久，最终是名字笔误，非元数据问题）
+
+### 20.5 遗留
+- 前台检测的"窗口标题"字段留 null（隐私红线：窗口标题不落盘）
+- 启发式 v1 仅"系统饱和 + 挤占"一种触发；"前台进程被饿着"直接信号留作 v2 增强
+- 启发式参数（阈值/时长/强度）尚未暴露到 UI/配置文件（SPEC §7 配置管线，M3 面板改造时一并做）

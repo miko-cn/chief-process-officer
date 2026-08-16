@@ -37,4 +37,6 @@ appsettings.local.json
 .win-dev-skills/
 
 # 本地工具索引（codegraph 等）
+.codegraph/msbuild.binlog
+msbuild.binlog
 .codegraph/

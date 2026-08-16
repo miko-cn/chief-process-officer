@@ -12,15 +12,32 @@ namespace Cpo.Core.Engine;
 /// </summary>
 public static class PolicyEngine
 {
+    /// <summary>系统关键进程名（进程名不含 .exe 后缀）。启发式绝不干预，防止把系统拖垮。</summary>
+    private static readonly HashSet<string> SystemCriticalNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "system idle process", "system", "registry", "memory compression", "secure system",
+        "svchost", "csrss", "dwm", "wininit", "winlogon", "services", "lsass", "smss", "explorer",
+        // 引擎自身：饱和时采样/评估进程自身 CPU 也高，绝不能把自己降了
+        "cpo.service", "cpo.app",
+    };
+
     /// <summary>
     /// 评估一次决策。
-    /// 规则按列表顺序优先（第一条匹配生效）；不匹配规则的进程不产生建议。
+    /// 规则按列表顺序优先（第一条匹配生效，启发式不覆盖规则）。
+    /// 启发式（<paramref name="heuristic"/> 非 null 时启用）：响应性保护——
+    /// 系统 CPU 饱和 + 进程挤占 + 非关键 三条件齐备才干预（会话⑲定案）。
     /// 前台进程保护：已知前台进程不降优（保守，避免误伤用户正在使用的程序）。
     /// </summary>
-    public static IReadOnlyList<PolicyProposal> Evaluate(EngineInput input)
+    public static IReadOnlyList<PolicyProposal> Evaluate(EngineInput input, HeuristicConfig? heuristic = null)
     {
         var proposals = new List<PolicyProposal>();
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        // 无前台信息 → 启发式降级保守模式（SPEC §6 定案：不主动降后台进程，避免误伤）。
+        // 显式规则不受影响（规则是用户明确意图）。
+        var heuristicArmed = heuristic is not null
+                             && input.ForegroundPid is not null
+                             && input.SystemCpuPercent >= heuristic.SystemSaturationPercent;
 
         foreach (var process in input.Processes)
         {
@@ -30,16 +47,40 @@ public static class PolicyEngine
             }
 
             var rule = FirstMatchingRule(input.Rules, process.Name);
-            if (rule is null)
+            if (rule is not null)
             {
-                continue;
+                proposals.Add(BuildProposal(now, process, rule));
+                continue; // 规则优先：命中规则的进程不再走启发式
             }
 
-            proposals.Add(BuildProposal(now, process, rule));
+            if (heuristicArmed && IsHeuristicTarget(process, heuristic!))
+            {
+                proposals.Add(BuildHeuristicProposal(now, process, input.SystemCpuPercent, heuristic!));
+            }
         }
 
         return proposals;
     }
+
+    /// <summary>启发式目标判定（三条件中的后两条：挤占者 + 非关键；系统饱和已由调用方保证）。</summary>
+    private static bool IsHeuristicTarget(ProcessState process, HeuristicConfig heuristic) =>
+        process.CpuPercent >= heuristic.ProcessCpuPercent
+        && !SystemCriticalNames.Contains(process.Name);
+
+    private static PolicyProposal BuildHeuristicProposal(
+        long now, ProcessState process, double systemCpuPercent, HeuristicConfig heuristic) => new()
+    {
+        TsMs = now,
+        Trigger = "heuristic.saturation",
+        TargetPid = process.Pid,
+        TargetName = process.Name,
+        Action = ProposalActionKind.SetPriority,
+        PriorityClass = heuristic.PriorityClass,
+        DurationMs = heuristic.DurationMs,
+        Reason = $"启发式: 系统 CPU 饱和（{systemCpuPercent:0}%），进程 {process.Name} 挤占 {process.CpuPercent:0}%，" +
+                 $"建议优先级 → {DescribePriority(heuristic.PriorityClass)}（{heuristic.DurationMs / 1000} 秒后自动恢复）",
+        RuleId = null,
+    };
 
     private static PolicyRule? FirstMatchingRule(IReadOnlyList<PolicyRule> rules, string processName)
     {

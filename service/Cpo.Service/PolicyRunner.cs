@@ -40,6 +40,26 @@ public sealed class PolicyRunner : IAsyncDisposable
         set => _interventionEnabled = value;
     }
 
+    /// <summary>
+    /// 启发式配置（响应性保护 v1，会话⑲定案）。
+    /// 默认启用保守配置（系统饱和 + 挤占 + 非关键三条件齐备才干预）；
+    /// 显式规则始终优先于启发式。
+    /// </summary>
+    public HeuristicConfig Heuristic { get; set; } = new();
+
+    /// <summary>
+    /// 当前前台进程 PID（GUI 侧 SetWinEventHook 检测后经 gRPC ReportForeground 上报，SPEC §6）。
+    /// null = 无前台信息 → 启发式降级保守模式（不主动降后台进程，避免误伤）。
+    /// -1 哨兵规避 volatile 对 Nullable&lt;int&gt; 的限制（x64 下 int 读写原子）。
+    /// </summary>
+    private volatile int _foregroundPid = -1;
+
+    public int? ForegroundPid
+    {
+        get => _foregroundPid < 0 ? null : _foregroundPid;
+        set => _foregroundPid = value ?? -1;
+    }
+
     /// <summary>最近一次建议（供 UI/日志展示）。</summary>
     public IReadOnlyList<PolicyProposal> LastProposals { get; private set; } = Array.Empty<PolicyProposal>();
 
@@ -92,12 +112,12 @@ public sealed class PolicyRunner : IAsyncDisposable
         {
             Processes = latestByPid.Values.ToArray(),
             SystemCpuPercent = systemCpu,
-            ForegroundPid = null, // M2 前台检测接入前保守：无前台信息
+            ForegroundPid = ForegroundPid, // GUI 侧上报（SPEC §6）；无前台信息时启发式保守
             Rules = _rules.Rules,
             CoreCount = _coreCount,
         };
 
-        var proposals = PolicyEngine.Evaluate(input);
+        var proposals = PolicyEngine.Evaluate(input, Heuristic);
         LastProposals = proposals;
         _bus.Publish(proposals);
 
