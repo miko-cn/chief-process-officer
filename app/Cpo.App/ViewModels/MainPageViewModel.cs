@@ -8,11 +8,12 @@ using Grpc.Net.Client;
 
 namespace Cpo.App.ViewModels;
 
-/// <summary>事件流列表项（UI 展示模型）。Key = 内容键（事件写入后不可变 → 稳定，供增量 diff）。</summary>
-public sealed record EventRow(string Time, string Type, string Summary)
+/// <summary>事件流列表项（UI 展示模型）。Key = 内容键（基于原始 ts_ms，事件不可变 → 稳定，供增量 diff）。</summary>
+public sealed record EventRow(long TsMs, string Time, string Type, string Summary)
 {
-    /// <summary>内容键：ts|type|summary。用于判断两轮拉取之间的差异（相同 = 不重绘）。</summary>
-    public string Key => $"{Time}|{Type}|{Summary}";
+    /// <summary>内容键：ts_ms|type|summary。用于判断两轮拉取之间的差异（相同 = 不重绘）。
+    /// 用原始毫秒而非显示格式——显示只到秒，若用显示格式，同一秒内同类型同摘要事件会 Key 撞车。</summary>
+    public string Key => $"{TsMs}|{Type}|{Summary}";
 }
 
 /// <summary>
@@ -234,12 +235,13 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
     }
 
     private static EventRow ToRow(TelemetryEventEnvelope envelope) => new(
+        envelope.TsMs,
         FormatTime(envelope.TsMs),
         envelope.Type,
         Summarize(envelope));
 
     private static string FormatTime(long tsMs) =>
-        DateTimeOffset.FromUnixTimeMilliseconds(tsMs).ToLocalTime().ToString("HH:mm:ss.fff");
+        DateTimeOffset.FromUnixTimeMilliseconds(tsMs).ToLocalTime().ToString("HH:mm:ss");
 
     private static string Summarize(TelemetryEventEnvelope envelope)
     {
