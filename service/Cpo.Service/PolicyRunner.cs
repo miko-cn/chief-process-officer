@@ -26,6 +26,7 @@ public sealed class PolicyRunner : IAsyncDisposable
     private readonly RuleStore _rules;
     private readonly ExecutionPath _execution;
     private readonly ProposalBus _bus = new();
+    private readonly IInterventionStore? _interventionStore;
     private readonly int _coreCount;
 
     /// <summary>引擎模式（M1 默认监督；按类别升级自动模式 M3 实现）。</summary>
@@ -77,12 +78,21 @@ public sealed class PolicyRunner : IAsyncDisposable
     /// <summary>最近一次建议（供 UI/日志展示）。</summary>
     public IReadOnlyList<PolicyProposal> LastProposals { get; private set; } = Array.Empty<PolicyProposal>();
 
-    public PolicyRunner(ITelemetryStore store, IProcessController controller, RuleStore rules, int coreCount)
+    /// <param name="interventionStore">生效干预持久化（会话⑳h）：非 null 时 Execute 成功落盘、
+    /// 恢复即删除；service 启动时经 <see cref="RestoreOrphanedAsync"/> 恢复残留干预。
+    /// null = 不持久化（测试/回放场景）。</param>
+    public PolicyRunner(
+        ITelemetryStore store,
+        IProcessController controller,
+        RuleStore rules,
+        int coreCount,
+        IInterventionStore? interventionStore = null)
     {
         _store = store;
         _controller = controller;
         _rules = rules;
         _execution = new ExecutionPath(controller);
+        _interventionStore = interventionStore;
         _coreCount = coreCount;
     }
 
@@ -176,6 +186,24 @@ public sealed class PolicyRunner : IAsyncDisposable
             {
                 var result = _execution.Execute(proposal);
                 events.Add(DecisionLogger.ToActionEvent(result));
+                // 生效干预持久化（会话⑳h）：实际应用成功（Error null = 非 already active/cooldown）
+                // 才落盘；恢复时删除（见下方两处）。进程消失/失败不落盘。
+                if (_interventionStore is not null
+                    && result.Succeeded
+                    && result.Error is null
+                    && result.OriginalState is { } original)
+                {
+                    await _interventionStore.SaveAsync(new ActiveIntervention(
+                        Pid: proposal.TargetPid,
+                        Name: proposal.TargetName,
+                        StartedMs: proposal.TsMs,
+                        DurationMs: proposal.DurationMs,
+                        Action: proposal.Action,
+                        TargetPriorityClass: proposal.PriorityClass,
+                        TargetAffinityMask: proposal.AffinityMask,
+                        OriginalState: original,
+                        RuleId: proposal.RuleId), ct);
+                }
             }
         }
 
@@ -194,17 +222,25 @@ public sealed class PolicyRunner : IAsyncDisposable
                 if (restoreEvt is not null)
                 {
                     events.Add(DecisionLogger.ToActionEvent(restoreEvt));
+                    if (_interventionStore is not null)
+                    {
+                        await _interventionStore.DeleteAsync(restoreEvt.Proposal.TargetPid, ct);
+                    }
                 }
             }
         }
 
-        // 过期干预恢复（决策日志中恢复动作同样留痕）
+        // 过期干预恢复（决策日志中恢复动作同样留痕；持久化状态同步删除）
         var restored = _execution.ReapExpired(nowMs);
         foreach (var evt in _execution.ExecutionLog.Skip(Math.Max(0, _execution.ExecutionLog.Count - restored)))
         {
             if (evt.Proposal.Trigger == "restore")
             {
                 events.Add(DecisionLogger.ToActionEvent(evt));
+                if (_interventionStore is not null)
+                {
+                    await _interventionStore.DeleteAsync(evt.Proposal.TargetPid, ct);
+                }
             }
         }
 
@@ -250,9 +286,90 @@ public sealed class PolicyRunner : IAsyncDisposable
             }
         }
 
+        // 持久化状态同步删除（会话⑳h）：开关关闭恢复的干预不再保留状态记录。
+        // 进程已消失的静默清除不产生事件 → 状态残留由下次启动 RestoreOrphanedAsync 自愈。
+        if (!enabled && _interventionStore is not null)
+        {
+            foreach (var evt in events)
+            {
+                if (evt is PolicyActionEvent { Kind: ActionKind.Restore } action)
+                {
+                    await _interventionStore.DeleteAsync(action.TargetPid, ct);
+                }
+            }
+        }
+
         events.Add(new InterventionToggledEvent(nowMs, enabled, source));
         await _store.AppendBatchAsync(events, ct);
         return (InterventionToggledEvent)events[^1];
+    }
+
+    /// <summary>
+    /// 启动恢复（会话⑳h）：service 异常退出（强杀/崩溃/断电）后，内存干预队列（ExecutionPath._active）
+    /// 随进程消失，已降级进程残留无人恢复。从持久化状态表加载残留干预并逐一恢复原值。
+    /// 恢复动作天然无害：即使 pid 已被复用（同名新进程），升回原值也不会造成伤害。
+    /// 恢复留痕（policy.action restore）供审阅面板审计；进程已退出/名字不符的记录仅清状态。
+    /// </summary>
+    public async Task RestoreOrphanedAsync(CancellationToken ct = default)
+    {
+        if (_interventionStore is null)
+        {
+            return;
+        }
+
+        var orphans = await _interventionStore.LoadAllAsync(ct);
+        if (orphans.Count == 0)
+        {
+            return;
+        }
+
+        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var events = new List<TelemetryEvent>(orphans.Count);
+        foreach (var orphan in orphans)
+        {
+            var state = _controller.GetState(orphan.Pid);
+            if (state is null
+                || !string.Equals(state.Name, orphan.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                // 进程已退出 / pid 被复用且名字不符：记录失效，仅清状态
+                await _interventionStore.DeleteAsync(orphan.Pid, ct);
+                continue;
+            }
+
+            var results = new List<InterventionResult>();
+            if (orphan.Action is ProposalActionKind.SetPriority or ProposalActionKind.SetBoth)
+            {
+                results.Add(_controller.SetPriorityClass(orphan.Pid, orphan.OriginalState.PriorityClass));
+            }
+
+            if (orphan.Action is ProposalActionKind.SetAffinity or ProposalActionKind.SetBoth)
+            {
+                results.Add(_controller.SetAffinityMask(orphan.Pid, orphan.OriginalState.AffinityMask));
+            }
+
+            await _interventionStore.DeleteAsync(orphan.Pid, ct);
+            var ok = results.All(r => r.Succeeded);
+            var proposal = new PolicyProposal
+            {
+                TsMs = nowMs,
+                Trigger = "restore",
+                TargetPid = orphan.Pid,
+                TargetName = orphan.Name,
+                Action = ProposalActionKind.Restore,
+                PriorityClass = orphan.OriginalState.PriorityClass,
+                AffinityMask = orphan.OriginalState.AffinityMask,
+                DurationMs = null,
+                Reason = $"启动恢复: service 异常退出后残留的干预已恢复原值（{orphan.Name}, pid {orphan.Pid}）",
+                RuleId = null,
+            };
+            events.Add(DecisionLogger.ToActionEvent(new ExecutionEvent(
+                proposal, ok, ok ? null : "restore failed", orphan.OriginalState, nowMs)));
+        }
+
+        if (events.Count > 0)
+        {
+            await _store.AppendBatchAsync(events, ct);
+        }
     }
 
     /// <summary>停止：恢复全部干预（SPEC：引擎退出时自动恢复原值）。</summary>

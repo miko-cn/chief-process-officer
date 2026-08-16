@@ -45,6 +45,30 @@ internal sealed class FakeProcessController : IProcessController
     }
 }
 
+/// <summary>生效干预持久化 fake（会话⑳h）：内存字典 + 调用记录。</summary>
+internal sealed class FakeInterventionStore : IInterventionStore
+{
+    public Dictionary<int, ActiveIntervention> Saved { get; } = new();
+    public List<string> Calls { get; } = new();
+
+    public Task SaveAsync(ActiveIntervention intervention, CancellationToken ct = default)
+    {
+        Calls.Add($"save:{intervention.Pid}");
+        Saved[intervention.Pid] = intervention;
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteAsync(int pid, CancellationToken ct = default)
+    {
+        Calls.Add($"delete:{pid}");
+        Saved.Remove(pid);
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<ActiveIntervention>> LoadAllAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ActiveIntervention>>(Saved.Values.ToList());
+}
+
 /// <summary>内存事件存储 fake：支持 PolicyRunner 需要的窗口/前缀查询（按 ts_ms 升序）。</summary>
 internal sealed class FakeTelemetryStore : ITelemetryStore
 {

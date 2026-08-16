@@ -67,8 +67,10 @@ internal static class Program
         }
 
         // 策略运行器：引擎 + 执行路径 + 决策日志
+        // 生效干预持久化（会话⑳h）：store 兼作 IInterventionStore——强杀/崩溃后残留干预可启动恢复
         // ProBalance 开关初始值：auto 启动默认开，supervised 启动默认关（开关只控制自动干预，遥测照常）
-        await using var runner = new PolicyRunner(store, ProcessController.CreateController(), rules, Environment.ProcessorCount)
+        await using var runner = new PolicyRunner(
+            store, ProcessController.CreateController(), rules, Environment.ProcessorCount, store)
         {
             Mode = options.Mode,
             InterventionEnabled = options.Mode == DecisionMode.Automatic,
@@ -114,6 +116,20 @@ internal static class Program
 
         try
         {
+            // 启动恢复（会话⑳h）：先确保 schema 就绪（restore 查 active_interventions 状态表；
+            // recorder.RunAsync 内部才初始化，必须在此显式初始化——旧库升级时表尚不存在，
+            // 曾因此裸崩：RestoreOrphaned 抛 "no such table" → 全局兜底 → service 直接退出）。
+            // 恢复失败不阻断主流程（异常防护原则：启动路径同样不能裸崩）。
+            try
+            {
+                await store.InitializeAsync(cts.Token);
+                await runner.RestoreOrphanedAsync(cts.Token);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[启动恢复] 异常（跳过，不阻断服务）: {ex.Message}");
+            }
+
             // 四个并行任务：采集写库 / 策略评估 / 分层清理 / 门卫握手
             var evaluateTask = EvaluateLoopAsync(runner, config.SystemSampleIntervalMs, cts.Token);
             var purgeTask = PurgeLoopAsync(store, config, cts.Token);

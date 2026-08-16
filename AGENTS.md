@@ -73,6 +73,7 @@ cd app/Cpo.App && winapp run . --detach
 | 进程优先级类传染 | **Windows ProBalance 会降后台进程为 BelowNormal，且子进程继承父进程优先级类**——一旦终端/宿主被降，其启动的一切进程全 BelowNormal；而 `ThreadPriority.Highest` 是相对进程类的（BelowNormal base 6 + Highest = base 8），⑳d 抗饿死防护被抵消。**service/app 必须启动自保 + 周期自检**（`EnsureProcessNormalPriority`：进程类非 Normal 即升回，每评估/轮询轮一次，成本一次 P/Invoke，会话⑳g 实机教训） |
 | 策略输入 | 固定滑动窗口（15s，会话⑳c 放宽——饱和时采样滞后实测超 5s）+ 每进程最新样本，**不要**增量窗口（采样落库有滞后） |
 | 干预防抖 | 恢复后 DurationMs 内冷却（`_lastRestoredMs`），恢复时刻由调用方传入 |
+| 生效干预持久化 | **干预队列（ExecutionPath._active）必须落盘**（`active_interventions` 表 + `IInterventionStore`）：强杀/崩溃/断电时内存队列丢失 → 已降级进程残留无人恢复。Execute 成功 Save、恢复即 Delete；**启动时 `RestoreOrphanedAsync` 恢复残留**（进程不在/名字不符仅清记录；恢复动作天然无害）。注意：启动恢复必须在 `store.InitializeAsync` **之后**（旧库升级无表时 RestoreOrphaned 曾裸崩 → service 直接退出，Program 已显式初始化 + 调用处 try/catch） |
 | ProBalance 开关 | 执行干预 ⇔ `Mode==Automatic && InterventionEnabled`（volatile 字段）；关闭 = 立即 RestoreAll 并留痕；切换事件 `policy.intervention_toggled`（schema §8）；App ToggleSwitch TwoWay 绑定必须配同步标志（`SyncInterventionEnabled`）防程序刷新误触发 gRPC |
 | 启发式（响应性保护） | 目标 = OS/前台响应性，降 CPU 是手段不是指标（会话⑲）；触发三条件齐备：系统饱和（≥90%）+ 进程挤占（≥50%）+ 非关键（非前台/非系统关键名单，**含引擎自身 cpo.service/cpo.app**）；无前台信息 = 整体保守跳过；规则永远优先。**两档保护**（⑳c）：前台进程本身绝不降 / 近期前台（1h，仅前台本身 pid）温和降（80% + 10s）/ **其余含前台子进程**（rg/编译等，降了不影响前台响应）标准降 50% + 30s；**条件解除提前恢复**（启发式干预 CPU 已低 → 立即恢复，规则干预除外） |
 | service 异常防护 | **所有采样/评估/清理循环必须 try/catch**（实机教训：TelemetryRecorder 曾因一次 SQLite disk I/O error 未处理异常裸崩，遥测停摆；EvaluateLoop/PurgeLoop/Gatekeeper 都有，唯独 recorder 漏了）；Program.Main 全局兜底 catch 走正常收尾 |

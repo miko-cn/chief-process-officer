@@ -1,3 +1,4 @@
+using Cpo.Core.Engine;
 using Cpo.Core.Storage;
 using Cpo.Core.Telemetry;
 using Xunit;
@@ -365,6 +366,80 @@ public class SqliteTelemetryStoreTests : IAsyncLifetime
             cmd.CommandText = "PRAGMA journal_mode";
             var mode = (string)(await cmd.ExecuteScalarAsync())!;
             Assert.Equal("wal", mode);
+        }
+        finally
+        {
+            foreach (var f in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+            {
+                if (File.Exists(f))
+                {
+                    File.Delete(f);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ActiveInterventions_SaveLoadDelete_RoundTrip()
+    {
+        // 会话⑳h：生效干预持久化往返
+        var intervention = new ActiveIntervention(
+            Pid: 42, Name: "powershell", StartedMs: 1000, DurationMs: 30_000,
+            Action: ProposalActionKind.SetPriority, TargetPriorityClass: 0x4000, TargetAffinityMask: null,
+            OriginalState: new ProcessControlState(42, "powershell", 0x20, 0xFF), RuleId: null);
+        var ruleIntervention = intervention with
+        {
+            Pid = 43, Name = "msbuild.exe", TargetPriorityClass = 0x4000,
+            OriginalState = new ProcessControlState(43, "msbuild.exe", 0x20, 0xFF),
+            RuleId = "r1",
+        };
+
+        await Store.SaveAsync(intervention);
+        await Store.SaveAsync(ruleIntervention);
+
+        var all = await Store.LoadAllAsync();
+        Assert.Equal(2, all.Count);
+        var loaded = all.Single(i => i.Pid == 42);
+        Assert.Equal("powershell", loaded.Name);
+        Assert.Equal(30_000, loaded.DurationMs);
+        Assert.Equal(0x4000, loaded.TargetPriorityClass);
+        Assert.Equal(0x20, loaded.OriginalState.PriorityClass);
+        Assert.Equal(0xFFul, loaded.OriginalState.AffinityMask);
+        Assert.Null(loaded.RuleId);
+        var loadedRule = all.Single(i => i.Pid == 43);
+        Assert.Equal("r1", loadedRule.RuleId);
+
+        await Store.DeleteAsync(42);
+        var remaining = await Store.LoadAllAsync();
+        Assert.Single(remaining);
+        Assert.Equal(43, remaining[0].Pid);
+    }
+
+    [Fact]
+    public async Task ActiveInterventions_SurviveStoreRecreation()
+    {
+        // 模拟"强杀后重启"：新 store 实例（同文件库）能加载上次残留的干预
+        var dbPath = Path.Combine(Path.GetTempPath(), $"cpo-interv-test-{Guid.NewGuid():N}.db");
+        try
+        {
+            await using (var store = new SqliteTelemetryStore(dbPath))
+            {
+                await store.InitializeAsync();
+                await store.SaveAsync(new ActiveIntervention(
+                    Pid: 42, Name: "powershell", StartedMs: 1000, DurationMs: null,
+                    Action: ProposalActionKind.SetPriority, TargetPriorityClass: 0x4000, TargetAffinityMask: null,
+                    OriginalState: new ProcessControlState(42, "powershell", 0x20, 0xFF), RuleId: null));
+            }
+
+            // 新实例（模拟 service 重启）：加载残留
+            await using (var store = new SqliteTelemetryStore(dbPath))
+            {
+                await store.InitializeAsync();
+                var loaded = await store.LoadAllAsync();
+                var record = Assert.Single(loaded);
+                Assert.Equal(42, record.Pid);
+                Assert.Equal(0x4000, record.TargetPriorityClass);
+            }
         }
         finally
         {

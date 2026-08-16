@@ -256,4 +256,138 @@ public class PolicyRunnerTests
             Assert.DoesNotContain(store.Events, e => e is PolicyActionEvent { Kind: ActionKind.Restore });
         }
     }
+
+    // ─── 生效干预持久化（会话⑳h）───
+
+    private static PolicyRunner CreatePersistentRunner(FakeTelemetryStore store, FakeProcessController controller,
+        FakeInterventionStore istore)
+    {
+        var runner = new PolicyRunner(store, controller, new RuleStore(), coreCount: 8, istore)
+        {
+            Mode = DecisionMode.Automatic,
+            InterventionEnabled = true,
+        };
+        runner.Heuristic = new HeuristicConfig();
+        return runner;
+    }
+
+    private static ActiveIntervention OrphanRecord(int pid = 42, string name = "powershell", long startedMs = 1000) =>
+        new(pid, name, startedMs, 30_000, ProposalActionKind.SetPriority, 0x4000, null,
+            new ProcessControlState(pid, name, 0x20, 0xFF), null);
+
+    [Fact]
+    public async Task Evaluate_PersistsActiveIntervention()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var istore = new FakeInterventionStore();
+        var runner = CreatePersistentRunner(store, controller, istore);
+        runner.ForegroundPid = 999;
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+
+            Assert.Contains(istore.Calls, c => c == "save:42");
+            var saved = Assert.Single(istore.Saved.Values);
+            Assert.Equal(0x4000, saved.TargetPriorityClass);
+            Assert.Equal(0x20, saved.OriginalState.PriorityClass);
+            Assert.Null(saved.RuleId);   // 启发式干预
+        }
+    }
+
+    [Fact]
+    public async Task Evaluate_ConditionCleared_DeletesPersistedIntervention()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var istore = new FakeInterventionStore();
+        var runner = CreatePersistentRunner(store, controller, istore);
+        runner.ForegroundPid = 999;
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+            Assert.Contains(istore.Saved, kv => kv.Key == 42);
+
+            // 条件解除 → 恢复 + 状态删除
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            store.Events.RemoveAll(e => e is CpuSampleEvent { Scope: SampleScope.Process });
+            store.Events.Add(new CpuSampleEvent(now - 1000, SampleScope.Process, 42, "powershell", 10, 500, null, 1000));
+            await runner.EvaluateAsync();
+
+            Assert.Contains(istore.Calls, c => c == "delete:42");
+            Assert.Empty(istore.Saved);
+        }
+    }
+
+    [Fact]
+    public async Task SetInterventionEnabled_False_DeletesPersistedInterventions()
+    {
+        var store = new FakeTelemetryStore();
+        SeedStormSample(store);
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var istore = new FakeInterventionStore();
+        var runner = CreatePersistentRunner(store, controller, istore);
+        runner.ForegroundPid = 999;
+        await using (runner)
+        {
+            await runner.EvaluateAsync();
+            Assert.Contains(istore.Saved, kv => kv.Key == 42);
+
+            await runner.SetInterventionEnabledAsync(false);
+
+            Assert.Contains(istore.Calls, c => c == "delete:42");
+            Assert.Empty(istore.Saved);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreOrphaned_RestoresProcessAndDeletes()
+    {
+        // 模拟强杀残留：进程还在，恢复原值 + 清状态 + 留痕
+        var store = new FakeTelemetryStore();
+        var controller = new FakeProcessController((42, "powershell", 0x20, 0xFF));
+        var istore = new FakeInterventionStore();
+        await istore.SaveAsync(OrphanRecord());
+        var runner = new PolicyRunner(store, controller, new RuleStore(), coreCount: 8, istore);
+
+        await runner.RestoreOrphanedAsync();
+
+        Assert.Contains(controller.Calls, c => c == "prio:42=32");   // 恢复原值 0x20
+        Assert.Empty(istore.Saved);
+        Assert.Contains(store.Events, e => e is PolicyActionEvent { Kind: ActionKind.Restore });
+    }
+
+    [Fact]
+    public async Task RestoreOrphan_ProcessGone_OnlyDeletesRecord()
+    {
+        var store = new FakeTelemetryStore();
+        var controller = new FakeProcessController();   // 空：GetState 返回 null（进程已退出）
+        var istore = new FakeInterventionStore();
+        await istore.SaveAsync(OrphanRecord());
+        var runner = new PolicyRunner(store, controller, new RuleStore(), coreCount: 8, istore);
+
+        await runner.RestoreOrphanedAsync();
+
+        Assert.Empty(controller.Calls);
+        Assert.Empty(istore.Saved);
+        Assert.DoesNotContain(store.Events, e => e.Type == TelemetryEventTypes.PolicyAction);
+    }
+
+    [Fact]
+    public async Task RestoreOrphan_PidReusedNameMismatch_OnlyDeletesRecord()
+    {
+        // pid 复用且名字不符（42 现在是别的进程）→ 记录失效，仅清状态（恢复无害但语义上不适用）
+        var store = new FakeTelemetryStore();
+        var controller = new FakeProcessController((42, "other.exe", 0x20, 0xFF));
+        var istore = new FakeInterventionStore();
+        await istore.SaveAsync(OrphanRecord());
+        var runner = new PolicyRunner(store, controller, new RuleStore(), coreCount: 8, istore);
+
+        await runner.RestoreOrphanedAsync();
+
+        Assert.Empty(controller.Calls);
+        Assert.Empty(istore.Saved);
+    }
 }

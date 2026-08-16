@@ -907,3 +907,29 @@ on:
 
 - 残余抖动可能：ProBalance 在系统高负载时仍可能再次降级 → 自检每 2s 升回（一次 P/Invoke，成本可忽略；抖动只发生在系统本来就在卡的时候，无碍）
 - M4 Windows 服务形态（LocalSystem）无交互式终端，继承传染源头消失，但 ProBalance 对后台服务仍可能触发——自检保留
+
+## 2026-08-17 会话 ⑳h — 生效干预持久化（"已降级队列"落盘 + 启动恢复闭环）
+
+**用户提出**："我们有缓存当前已降级队列吗？及时把他们的优先级恢复回来很重要。"
+
+**审计结论**：队列有（`ExecutionPath._active` 内存字典），恢复路径也有 4 条（条件解除提前恢复 ⑳b / 超时 ReapExpired / 进程退出清除 / 停止 RestoreAll）——但**队列纯内存**：service 被强杀/崩溃/断电时队列随进程消失，已降级进程残留无人恢复。**实机已发生**：23:58 强杀重启 service 时 chrome 的 BelowNormal 残留（DB 无 restore 记录，chrome 变 Normal 不是我们恢复的）。
+
+### 20h.1 实现
+
+1. **状态表 `active_interventions`**（schema §9.3，非遥测事件表）：pid/name/started_ms/duration_ms/action/target_priority/target_affinity/original_priority/original_affinity/rule_id；不参与 CountAsync/路由/purge
+2. **`IInterventionStore` 接口**（core/Storage），`SqliteTelemetryStore` 实现（Save INSERT OR REPLACE / Delete / LoadAll）
+3. **PolicyRunner 落盘点**：ctor 可选参数注入（测试传 null 不持久化）；EvaluateAsync 中 Execute **实际应用成功**（Error null = 非 already active/cooldown）才 Save；条件解除恢复 / ReapExpired / 开关关闭恢复 → Delete；进程消失的静默清除由下次启动自愈
+4. **`RestoreOrphanedAsync` 启动恢复**：Program 在评估循环前调用——加载残留 → 进程不在/pid 复用名字不符 → 仅清记录；否则恢复原值 + 清记录 + 留痕（policy.action restore，审阅面板可见）
+5. **安全性洞察**：恢复动作天然无害（升回原值；即使 pid 被复用误匹配，把进程升回 Normal 不会造成伤害）→ 校验从简（进程存在 + 名字匹配）
+
+### 20h.2 过程中的雷（又一个启动路径裸崩）
+
+- **RestoreOrphanedAsync 在 store.InitializeAsync 之前执行**（recorder.RunAsync 内部才初始化）→ 旧库无 `active_interventions` 表 → LoadAllAsync 抛 "no such table" → 全局兜底 catch → **service 直接退出**（实机复现：service 启动即消失）
+- 修复：Program 显式 `store.InitializeAsync` 后再恢复 + 调用处 try/catch（启动路径同样不能裸崩，异常防护原则）
+- 启示：**任何启动时新增的 DB 访问，先确认 schema 初始化时序**（旧库升级场景）
+
+### 20h.3 验证
+
+- ✅ 138/138 测试全绿（+8：PolicyRunner 落盘/条件解除删除/开关关闭删除/启动恢复 3 场景 + store 往返/跨实例持久化）
+- ✅ 实机闭环：notepad 降 BelowNormal + 手工 INSERT 残留 → 重启 service → **notepad 恢复 Normal + 状态表清空 + policy.action restore 留痕**；进程已退出的残留 → 仅清状态
+- 环境：service（新 PID）运行中

@@ -176,6 +176,29 @@ CREATE INDEX IF NOT EXISTS idx_event_log_ts_type ON event_log (ts_ms, type);
 CREATE INDEX IF NOT EXISTS idx_event_log_type   ON event_log (type);
 ```
 
+### 9.3 生效干预状态表（会话⑳h 定案，非遥测事件表）
+
+`ExecutionPath._active`（内存干预队列）的持久化镜像——service 被强杀/崩溃/断电时内存队列丢失，已降级进程残留无人恢复；本表 + service 启动时 `RestoreOrphanedAsync` 闭环（加载残留 → 校验进程仍在且名字匹配 → 恢复原值 → 删除记录；进程已退出/pid 复用名字不符 → 仅删记录）。
+
+```sql
+CREATE TABLE IF NOT EXISTS active_interventions (
+    pid                INTEGER PRIMARY KEY,
+    name               TEXT    NOT NULL,
+    started_ms         INTEGER NOT NULL,
+    duration_ms        INTEGER,
+    action             TEXT    NOT NULL,      -- ProposalActionKind 枚举名
+    target_priority    INTEGER,
+    target_affinity    INTEGER,
+    original_priority  INTEGER NOT NULL,      -- 恢复原值
+    original_affinity  INTEGER NOT NULL,
+    rule_id            TEXT                   -- null = 启发式干预
+);
+```
+
+- 生命周期：Execute 实际应用成功 → `SaveAsync`（INSERT OR REPLACE）；恢复（条件解除/超时/开关关闭）→ `DeleteAsync`；进程消失的静默清除由下次启动自愈
+- 不参与 CountAsync / 路由 / purge（状态短命，逐条增删）
+- 接口：`IInterventionStore`（core/Storage），`SqliteTelemetryStore` 实现，PolicyRunner 经可选参数注入（测试/回放可传 null 不持久化）
+
 - 写入：按事件类型路由到对应表（`TelemetryTableRouter` 单一事实来源）
 - 查询：按类型自动路由；跨表查询（回放/全量统计）用 UNION
 - 回放 = 目标表 `ORDER BY ts_ms ASC`，按 `type` 过滤即得单一事件流

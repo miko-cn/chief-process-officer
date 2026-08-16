@@ -1,13 +1,15 @@
+using Cpo.Core.Engine;
 using Cpo.Core.Telemetry;
 using Microsoft.Data.Sqlite;
 
 namespace Cpo.Core.Storage;
 
 /// <summary>
-/// SQLite 遥测存储实现（schema §8.2 双表分层：samples 热表 + event_log 冷表）。
+/// SQLite 遥测存储实现（schema §8.2 双表分层：samples 热表 + event_log 冷表；
+/// 会话⑳h 起兼作生效干预状态表 active_interventions 的持久化）。
 /// 线程安全：内部互斥串行化写入；连接按需创建。
 /// </summary>
-public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
+public sealed class SqliteTelemetryStore : ITelemetryStore, IInterventionStore, IAsyncDisposable
 {
     private readonly string _connectionString;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -230,6 +232,96 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
         }
     }
 
+    // ─── IInterventionStore（会话⑳h：生效干预持久化，启动恢复闭环）───
+
+    public async Task SaveAsync(ActiveIntervention intervention, CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                "INSERT OR REPLACE INTO active_interventions " +
+                "(pid, name, started_ms, duration_ms, action, target_priority, target_affinity, " +
+                " original_priority, original_affinity, rule_id) VALUES " +
+                "($pid, $name, $started, $duration, $action, $targetPrio, $targetAff, " +
+                " $origPrio, $origAff, $ruleId)";
+            cmd.Parameters.AddWithValue("$pid", intervention.Pid);
+            cmd.Parameters.AddWithValue("$name", intervention.Name);
+            cmd.Parameters.AddWithValue("$started", intervention.StartedMs);
+            cmd.Parameters.AddWithValue("$duration", (object?)intervention.DurationMs ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$action", intervention.Action.ToString());
+            cmd.Parameters.AddWithValue("$targetPrio", (object?)intervention.TargetPriorityClass ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$targetAff", ToInt64OrNull(intervention.TargetAffinityMask) ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$origPrio", intervention.OriginalState.PriorityClass);
+            cmd.Parameters.AddWithValue("$origAff", unchecked((long)intervention.OriginalState.AffinityMask));
+            cmd.Parameters.AddWithValue("$ruleId", (object?)intervention.RuleId ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task DeleteAsync(int pid, CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM active_interventions WHERE pid = $pid";
+            cmd.Parameters.AddWithValue("$pid", pid);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<ActiveIntervention>> LoadAllAsync(CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            var result = new List<ActiveIntervention>();
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT pid, name, started_ms, duration_ms, action, target_priority, " +
+                              "target_affinity, original_priority, original_affinity, rule_id " +
+                              "FROM active_interventions";
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                var pid = reader.GetInt32(0);
+                var originalAffinity = unchecked((ulong)reader.GetInt64(8));
+                result.Add(new ActiveIntervention(
+                    Pid: pid,
+                    Name: reader.GetString(1),
+                    StartedMs: reader.GetInt64(2),
+                    DurationMs: reader.IsDBNull(3) ? null : reader.GetInt64(3),
+                    Action: Enum.Parse<ProposalActionKind>(reader.GetString(4)),
+                    TargetPriorityClass: reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                    TargetAffinityMask: reader.IsDBNull(6) ? null : unchecked((ulong)reader.GetInt64(6)),
+                    OriginalState: new ProcessControlState(
+                        pid, reader.GetString(1), reader.GetInt32(7), originalAffinity),
+                    RuleId: reader.IsDBNull(9) ? null : reader.GetString(9)));
+            }
+
+            return result;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private static object? ToInt64OrNull(ulong? value) =>
+        value is ulong v ? unchecked((long)v) : null;
+
     public async ValueTask DisposeAsync()
     {
         await _gate.WaitAsync();
@@ -411,5 +503,21 @@ public sealed class SqliteTelemetryStore : ITelemetryStore, IAsyncDisposable
         );
         CREATE INDEX IF NOT EXISTS idx_event_log_ts_type ON {{TelemetryTableRouter.EventLogTableName}} (ts_ms, type);
         CREATE INDEX IF NOT EXISTS idx_event_log_type   ON {{TelemetryTableRouter.EventLogTableName}} (type);
+
+        -- 生效干预状态表（会话⑳h）：ExecutionPath._active 的持久化镜像。
+        -- service 被强杀/崩溃时内存队列丢失 → 已降级进程无人恢复；本表 + 启动恢复闭环。
+        -- 非遥测事件表：不参与 CountAsync / 路由 / purge（状态短命，逐条增删）。
+        CREATE TABLE IF NOT EXISTS active_interventions (
+            pid                INTEGER PRIMARY KEY,
+            name               TEXT    NOT NULL,
+            started_ms         INTEGER NOT NULL,
+            duration_ms        INTEGER,
+            action             TEXT    NOT NULL,
+            target_priority    INTEGER,
+            target_affinity    INTEGER,
+            original_priority  INTEGER NOT NULL,
+            original_affinity  INTEGER NOT NULL,
+            rule_id            TEXT
+        );
         """;
 }
