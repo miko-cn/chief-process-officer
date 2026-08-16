@@ -34,6 +34,10 @@ public sealed class TelemetryRecorder : IAsyncDisposable
     /// <summary>开始录制（挂起直到取消；先立即采一次，之后按配置间隔）。</summary>
     public async Task RunAsync(CancellationToken token)
     {
+        // 采样线程提优先级（Normal 类 + Highest 相对 = base 10 > 普通进程 base 8）：
+        // 系统饱和时不被风暴进程饿死（会话⑳d——实测 16 核 100% 时采样失效、风暴进程样本缺席）
+        Thread.CurrentThread.Priority = ThreadPriority.Highest;
+
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, token);
         await _store.InitializeAsync(linked.Token);
         await SampleOnceAsync(linked.Token);

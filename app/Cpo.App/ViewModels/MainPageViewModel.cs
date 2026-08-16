@@ -153,6 +153,8 @@ public partial class MainPageViewModel : ObservableObject, IDisposable
 
         _ = Task.Run(async () =>
         {
+            // 轮询线程提优先级：系统饱和卡顿时数据仍快速刷新（会话⑲ 19.3 抗卡顿要求 + ⑳d）
+            System.Threading.Thread.CurrentThread.Priority = System.Threading.ThreadPriority.Highest;
             try
             {
                 while (await _timer.WaitForNextTickAsync(_cts.Token))

@@ -139,6 +139,8 @@ internal static class Program
 
     private static async Task EvaluateLoopAsync(PolicyRunner runner, int intervalMs, CancellationToken ct)
     {
+        // 评估线程提优先级：饱和时照常评估（与采样线程同策略，会话⑳d）
+        Thread.CurrentThread.Priority = ThreadPriority.Highest;
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(Math.Max(500, intervalMs)));
         while (await timer.WaitForNextTickAsync(ct))
         {

@@ -779,3 +779,28 @@ on:
 - ✅ 127/127 全绿（子进程测试改写：引擎层 ForegroundChildProcess_StandardDowngrade + PolicyRunner 集成 DowngradesForegroundChildProcess）
 - ✅ 实机：启发式链路正常（饱和时 Taskmgr/chrome/MiniMax 常驻挤占者被降、动作/恢复落盘）；前台本身不降（MiniMax 前台期间无自身降级记录）
 - 环境：service（35020）+ app（35376）运行中，风暴已清
+
+## 2026-08-16 会话 ⑳d — 采样饱和修复（启发式"看不见风暴进程"根因）
+
+**背景**：用户指出关键问题——16 核风暴时启发式完全管不到高占用进程（实机：powershell 样本 CPU=0/缺失，只见常驻旧进程）。这是**数据面失效**（采样饿死），不是策略问题；先修数据面。
+
+### 20d.1 根因（两个叠加）
+
+1. **调度饿死**：采样/评估线程是普通优先级（Normal 类 base 8），16 个风暴进程（base 8）抢满 16 核时，采样线程拿不到时间片——2s 定时器实际间隔拖到 10s+，进程样本 CPU=0 或缺失
+2. **O(N²) 性能坑**：`ProcessSampler.ParentPidOf` 对**每个进程单独** CreateToolhelp32Snapshot + 全表扫描——几百进程每轮数万次快照遍历，饱和时雪上加霜
+
+### 20d.2 修复
+
+1. **线程提优先级**（三处）：采样循环（TelemetryRecorder.RunAsync）+ 评估循环（Program.EvaluateLoopAsync）+ app 轮询线程（抗卡顿要求：系统卡顿时数据仍快速刷新）——`ThreadPriority.Highest`（Normal 类 +2 相对 = base 10 > 普通进程 8；不需要特殊权限）
+2. **O(N²) → O(N)**：`SnapshotParentMap()` 一轮 Toolhelp32 收集全部 (pid→ppid) 查表，删除逐进程 ParentPidOf
+
+### 20d.3 验证（16 核风暴实测）
+
+- ✅ 修复前：powershell 样本 CPU=0/缺失 → 启发式零决策
+- ✅ 修复后：powershell 样本真实（56~66%，intervalMs=2000 正常）→ `heuristic.saturation` 决策 + setPriority 执行（64% 挤占 → BelowNormal/30s）
+- ✅ 进程消失路径正常（杀风暴后 "process not found" 容错，静默移除）
+- ✅ 127/127 单测全绿（改动为 Windows 运行时行为，实机验证）
+
+### 20d.4 备注
+- 提优先级上限：风暴进程若为 HIGH 类（base 13）仍会饿采样（10 < 13）——v1 接受（99% 场景风暴为 Normal；编译器/工具类少见 HIGH）
+- 采样间隔拉长时 CPU% 计算用真实 elapsed（已有逻辑），不会因间隔放大而失真

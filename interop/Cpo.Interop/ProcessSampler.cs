@@ -13,17 +13,20 @@ public static partial class ProcessSampler
 {
     /// <summary>
     /// 采集全部可见进程快照。单进程失败（进程已退出/权限拒绝）跳过不影响整体。
+    /// 父子关系用**一轮** Toolhelp32 快照查表（原实现对每个进程单独建快照全表扫描，
+    /// O(N²)——几百进程时每轮采样数万次扫描，系统饱和时被饿得更惨，会话⑳d 修复）。
     /// </summary>
     public static IReadOnlyList<ProcessSnapshot> SnapshotAll()
     {
         var snapshots = new List<ProcessSnapshot>();
+        var parents = SnapshotParentMap();
         var processes = Process.GetProcesses();
 
         foreach (var p in processes)
         {
             try
             {
-                snapshots.Add(Capture(p));
+                snapshots.Add(Capture(p, parents));
             }
             catch (Exception ex)
             {
@@ -39,7 +42,41 @@ public static partial class ProcessSampler
         return snapshots;
     }
 
-    private static ProcessSnapshot Capture(Process p)
+    /// <summary>一轮快照收集全部 (pid → ppid) 映射。失败返回空表（调用方容错）。</summary>
+    private static Dictionary<int, int> SnapshotParentMap()
+    {
+        var map = new Dictionary<int, int>();
+        try
+        {
+            var entry = new Native.ProcessEntry32
+            {
+                dwSize = (uint)Marshal.SizeOf<Native.ProcessEntry32>(),
+            };
+
+            using var snapshot = Native.CreateToolhelp32Snapshot(Native.TH32CS_SNAPPROCESS, 0);
+            if (snapshot.IsInvalid)
+            {
+                return map;
+            }
+
+            if (Native.Process32First(snapshot, ref entry))
+            {
+                do
+                {
+                    map[(int)entry.th32ProcessID] = (int)entry.th32ParentProcessID;
+                }
+                while (Native.Process32Next(snapshot, ref entry));
+            }
+        }
+        catch (Exception)
+        {
+            // 快照失败：返回空表（父进程未知按 0）
+        }
+
+        return map;
+    }
+
+    private static ProcessSnapshot Capture(Process p, IReadOnlyDictionary<int, int> parents)
     {
         var totalCpuMs = 0L;
         try
@@ -77,15 +114,7 @@ public static partial class ProcessSampler
             // 系统进程（svchost 等）句柄打开可能被拒：内存取不到按 0，不丢弃整条快照
         }
 
-        var parentPid = 0;
-        try
-        {
-            parentPid = ParentPidOf(p.Id);
-        }
-        catch (Exception)
-        {
-            // 快照句柄失败不影响进程本体采集
-        }
+        var parentPid = parents.TryGetValue(p.Id, out var ppid) ? ppid : 0;
 
         return new ProcessSnapshot(
             Pid: p.Id,
@@ -106,41 +135,6 @@ public static partial class ProcessSampler
         catch
         {
             return $"pid-{p.Id}";
-        }
-    }
-
-    private static int ParentPidOf(int pid)
-    {
-        try
-        {
-            var entry = new Native.ProcessEntry32
-            {
-                dwSize = (uint)Marshal.SizeOf<Native.ProcessEntry32>(),
-            };
-
-            using var snapshot = Native.CreateToolhelp32Snapshot(Native.TH32CS_SNAPPROCESS, 0);
-            if (snapshot.IsInvalid)
-            {
-                return 0;
-            }
-
-            if (Native.Process32First(snapshot, ref entry))
-            {
-                do
-                {
-                    if (entry.th32ProcessID == pid)
-                    {
-                        return (int)entry.th32ParentProcessID;
-                    }
-                }
-                while (Native.Process32Next(snapshot, ref entry));
-            }
-
-            return 0;
-        }
-        catch (Exception)
-        {
-            return 0;
         }
     }
 
